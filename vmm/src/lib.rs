@@ -3,6 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+/// Amount of iterations before auto-converging starts.
+const AUTO_CONVERGE_ITERATION_DELAY: u64 = 2;
+/// Step size in percent to increase the vCPU throttling.
+const AUTO_CONVERGE_STEP_SIZE: u8 = 10;
+/// Amount of iterations after that we increase vCPU throttling.
+const AUTO_CONVERGE_ITERATION_INCREASE: u64 = 2;
+/// Maximum vCPU throttling value.
+const AUTO_CONVERGE_MAX: u8 = 99;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write, stdout};
@@ -108,6 +117,7 @@ mod sigwinch_listener;
 mod sync_utils;
 mod uffd;
 mod userfaultfd;
+mod vcpu_throttling;
 pub mod vm;
 pub mod vm_config;
 
@@ -1373,6 +1383,15 @@ impl Vmm {
         Ok((receive_duration, restore_duration))
     }
 
+    fn can_increase_autoconverge_step(s: &MemoryMigrationContext) -> bool {
+        if (s.iteration as u64) < AUTO_CONVERGE_ITERATION_DELAY {
+            false
+        } else {
+            let iteration = s.iteration as u64 - AUTO_CONVERGE_ITERATION_DELAY;
+            iteration.is_multiple_of(AUTO_CONVERGE_ITERATION_INCREASE)
+        }
+    }
+
     /// Performs the initial memory transmission (iteration zero) plus a
     /// variable number of memory iterations with the goal to eventually migrate
     /// the VM in a reasonably small downtime.
@@ -1419,12 +1438,25 @@ impl Vmm {
                         },
                         memory_pages_constant_count: 0, /* TODO */
                     }),
-                    None,
+                    Some(vm.throttle_percent()),
                     s.estimated_downtime,
                 );
         };
 
         loop {
+            // todo: check if auto-converge is enabled at all?
+            if Self::can_increase_autoconverge_step(ctx)
+                && vm.throttle_percent() < AUTO_CONVERGE_MAX
+            {
+                let current_throttle = vm.throttle_percent();
+                let new_throttle = current_throttle + AUTO_CONVERGE_STEP_SIZE;
+                let new_throttle = std::cmp::min(new_throttle, AUTO_CONVERGE_MAX);
+                info!("Increasing auto-converge: {new_throttle}%");
+                if new_throttle != current_throttle {
+                    vm.set_throttle_percent(new_throttle);
+                }
+            }
+
             let iteration_begin = Instant::now();
 
             let iteration_table = if ctx.iteration == 0 {
@@ -1598,6 +1630,11 @@ impl Vmm {
             cancel_migration,
         );
         let downtime_begin = Instant::now();
+        // End throttle thread
+        info!("stopping vcpu throttling");
+        vm.reset_vcpu_throttle_thread();
+        info!("stopped vcpu throttling");
+
         let remaining = remaining?;
 
         // Skip if already paused, e.g. when migrating a paused VM.
