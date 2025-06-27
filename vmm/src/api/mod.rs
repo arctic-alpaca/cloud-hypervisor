@@ -53,7 +53,7 @@ use vmm_sys_util::eventfd::EventFd;
 pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
-use crate::config::RestoreConfig;
+use crate::config::{RestoreConfig, RestoredNetConfig};
 use crate::device_tree::DeviceTree;
 use crate::migration_transport::MAX_MIGRATION_CONNECTIONS;
 use crate::vm::{Error as VmError, VmState};
@@ -351,6 +351,9 @@ pub struct VmReceiveMigrationData {
     /// Directory containing the TLS server certificate (server-cert.pem), the TLS server key (server-key.pem), and the client TLS root CA certificate (ca-cert.pem).
     #[serde(default)]
     pub tls_dir: Option<PathBuf>,
+    /// Map with new network FDs on the new host.
+    #[serde(default)]
+    pub net_fds: Vec<RestoredNetConfig>,
 }
 
 #[derive(Debug, Error)]
@@ -411,6 +414,7 @@ impl VmReceiveMigrationData {
             let data = Self {
                 receiver_url: migration.to_owned(),
                 tls_dir: None,
+                net_fds: vec![],
             };
 
             data.validate()?;
@@ -437,6 +441,7 @@ impl VmReceiveMigrationData {
         let data = Self {
             receiver_url,
             tls_dir,
+            net_fds: vec![],
         };
 
         data.validate()?;
@@ -2187,6 +2192,7 @@ mod unit_tests {
             VmReceiveMigrationData {
                 receiver_url: "tcp:192.168.1.1:8080".to_string(),
                 tls_dir: None,
+                net_fds: vec![],
             }
         );
 
@@ -2210,6 +2216,7 @@ mod unit_tests {
             VmReceiveMigrationData {
                 receiver_url: "tcp:192.168.1.1:8080".to_string(),
                 tls_dir: Some(tls_dir),
+                net_fds: vec![],
             }
         );
 
