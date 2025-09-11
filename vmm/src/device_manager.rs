@@ -2539,6 +2539,9 @@ impl DeviceManager {
             ConsoleTransport::Socket(_) => {
                 return Err(DeviceManagerError::NoSocketOptionSupportForConsoleDevice);
             }
+            ConsoleTransport::Tcp(_) => {
+                return Err(DeviceManagerError::NoSocketOptionSupportForConsoleDevice);
+            }
             ConsoleTransport::Null => Endpoint::Null,
             ConsoleTransport::Off => return Ok(None),
         };
@@ -2620,6 +2623,7 @@ impl DeviceManager {
             | ConsoleTransport::Null
             | ConsoleTransport::Pty(_)
             | ConsoleTransport::Socket(_) => None,
+            ConsoleTransport::Tcp(_) => None,
         };
 
         if !matches!(console_info.serial, ConsoleTransport::Off) {
@@ -2627,7 +2631,8 @@ impl DeviceManager {
             self.serial_manager = match console_info.serial {
                 ConsoleTransport::Pty(_)
                 | ConsoleTransport::Tty(_)
-                | ConsoleTransport::Socket(_) => {
+                | ConsoleTransport::Socket(_)
+                | ConsoleTransport::Tcp(_) => {
                     let serial_manager = SerialManager::new(
                         serial,
                         console_info.serial,
@@ -2658,7 +2663,8 @@ impl DeviceManager {
                 ConsoleTransport::Off
                 | ConsoleTransport::Null
                 | ConsoleTransport::Pty(_)
-                | ConsoleTransport::Socket(_) => None,
+                | ConsoleTransport::Socket(_)
+                | ConsoleTransport::Tcp(_) => None,
             };
             if let Some(writer) = debug_console_writer {
                 let _ = self.add_debug_console_device(writer)?;

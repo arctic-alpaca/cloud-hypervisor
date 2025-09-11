@@ -5,7 +5,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::net::Shutdown;
+use std::net::{Shutdown, TcpStream};
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
@@ -122,6 +122,8 @@ pub struct SerialManager {
     handle: Option<thread::JoinHandle<()>>,
     pty_write_out: Option<Arc<AtomicBool>>,
     socket_path: Option<PathBuf>,
+    /// Tracks the active TCP client so `Drop` can shut it down before joining.
+    active_tcp_stream: Arc<Mutex<Option<TcpStream>>>,
 }
 
 impl SerialManager {
@@ -181,13 +183,14 @@ impl SerialManager {
                 }
                 listener.as_raw_fd()
             }
+            ConsoleTransport::Tcp(ref listener) => listener.as_raw_fd(),
             _ => return Ok(None),
         };
 
-        let in_event = if let ConsoleTransport::Socket(_) = transport {
-            EpollDispatch::Socket
-        } else {
-            EpollDispatch::File
+        let in_event = match &transport {
+            ConsoleTransport::Socket(_) => EpollDispatch::Socket,
+            ConsoleTransport::Tcp(_) => EpollDispatch::Tcp,
+            _ => EpollDispatch::File,
         };
 
         epoll::ctl(
@@ -223,6 +226,7 @@ impl SerialManager {
             handle: None,
             pty_write_out,
             socket_path,
+            active_tcp_stream: Arc::new(Mutex::new(None)),
         }))
     }
 
@@ -264,6 +268,10 @@ impl SerialManager {
         let serial = self.serial.clone();
         let pty_write_out = self.pty_write_out.clone();
         let mut reader: Option<UnixStream> = None;
+        let mut reader_tcp: Option<TcpStream> = None;
+        // Keep `active_tcp_stream` and `reader_tcp` in sync: the former is the
+        // shutdown handle, the latter is the worker's read-side owner.
+        let active_tcp_stream = self.active_tcp_stream.clone();
 
         // In case of PTY, we want to be able to detect a connection on the
         // other end of the PTY. This is done by detecting there's no event
@@ -349,7 +357,45 @@ impl SerialManager {
                                     reader = Some(unix_stream);
                                     serial.lock().unwrap().set_out(Some(Box::new(writer)));
                                 }
-                                EpollDispatch::Tcp => {}
+                                EpollDispatch::Tcp => {
+                                    // New connection request arrived.
+                                    // Shutdown the previous connection, if any
+                                    if let Some(ref previous_reader) = reader_tcp {
+                                        previous_reader
+                                            .shutdown(Shutdown::Both)
+                                            .map_err(Error::AcceptConnection)?;
+                                        active_tcp_stream.lock().unwrap().take();
+                                    }
+
+                                    let ConsoleTransport::Tcp(ref listener) = transport else {
+                                        unreachable!();
+                                    };
+
+                                    // Events on the listening socket will be connection requests.
+                                    // Accept them, create a reader and a writer.
+                                    let (tcp_stream, _) =
+                                        listener.accept().map_err(Error::AcceptConnection)?;
+                                    let active_tcp_stream_handle =
+                                        tcp_stream.try_clone().map_err(Error::CloneStream)?;
+                                    let writer =
+                                        tcp_stream.try_clone().map_err(Error::CloneStream)?;
+
+                                    epoll::ctl(
+                                        epoll_fd.as_raw_fd(),
+                                        epoll::ControlOptions::EPOLL_CTL_ADD,
+                                        tcp_stream.as_raw_fd(),
+                                        epoll::Event::new(
+                                            epoll::Events::EPOLLIN,
+                                            EpollDispatch::File as u64,
+                                        ),
+                                    )
+                                    .map_err(Error::Epoll)?;
+
+                                    *active_tcp_stream.lock().unwrap() =
+                                        Some(active_tcp_stream_handle);
+                                    reader_tcp = Some(tcp_stream);
+                                    serial.lock().unwrap().set_out(Some(Box::new(writer)));
+                                }
                                 EpollDispatch::File => {
                                     if event.events & libc::EPOLLIN as u32 != 0 {
                                         let mut input = [0u8; 64];
@@ -365,6 +411,30 @@ impl SerialManager {
                                                             .shutdown(Shutdown::Both)
                                                             .map_err(Error::ShutdownConnection)?;
                                                         reader = None;
+                                                        serial
+                                                            .as_ref()
+                                                            .lock()
+                                                            .unwrap()
+                                                            .set_out(None);
+                                                    }
+                                                    count
+                                                } else {
+                                                    0
+                                                }
+                                            }
+                                            ConsoleTransport::Tcp(_) => {
+                                                if let Some(mut serial_reader) = reader_tcp.as_ref()
+                                                {
+                                                    let count = serial_reader
+                                                        .read(&mut input)
+                                                        .map_err(Error::ReadInput)?;
+                                                    if count == 0 {
+                                                        info!("Remote end closed serial socket");
+                                                        serial_reader
+                                                            .shutdown(Shutdown::Both)
+                                                            .map_err(Error::ShutdownConnection)?;
+                                                        reader_tcp = None;
+                                                        active_tcp_stream.lock().unwrap().take();
                                                         serial
                                                             .as_ref()
                                                             .lock()
@@ -432,6 +502,10 @@ impl SerialManager {
 
 impl Drop for SerialManager {
     fn drop(&mut self) {
+        if let Some(tcp_stream) = self.active_tcp_stream.lock().unwrap().take() {
+            tcp_stream.shutdown(Shutdown::Both).ok();
+        }
+
         self.kill_evt.write(1).ok();
         if let Some(handle) = self.handle.take() {
             handle.join().ok();
