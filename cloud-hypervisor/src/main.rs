@@ -1018,6 +1018,7 @@ mod unit_tests {
                     file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
+                    url: None,
                 },
             },
             console: ConsoleConfig {
@@ -1025,6 +1026,7 @@ mod unit_tests {
                     file: None,
                     mode: ConsoleOutputMode::Tty,
                     socket: None,
+                    url: None,
                 },
                 pci_common: PciDeviceCommonConfig::default(),
             },
