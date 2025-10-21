@@ -1003,6 +1003,7 @@ impl Vmm {
                     req,
                     socket,
                     memory_files,
+                    receive_data_migration.tcp_serial_url.clone(),
                     receive_data_migration.zones.clone(),
                 )?;
 
@@ -1164,6 +1165,7 @@ impl Vmm {
         req: &Request,
         socket: &mut T,
         existing_memory_files: HashMap<u32, File>,
+        tcp_serial_url: Option<String>,
         zones: Vec<MemoryZoneConfig>,
     ) -> std::result::Result<Arc<Mutex<MemoryManager>>, MigratableError>
     where
@@ -1189,6 +1191,11 @@ impl Vmm {
 
         let config = vm_migration_config.vm_config.clone();
         self.vm_config = Some(vm_migration_config.vm_config);
+        if let Some(tcp_serial_url) = tcp_serial_url {
+            let mut vm_config = self.vm_config.as_mut().unwrap().lock().unwrap();
+            vm_config.serial.common.url = Some(tcp_serial_url);
+        }
+
         self.console_info = Some(pre_create_console_devices(self).map_err(|e| {
             MigratableError::MigrateReceive(anyhow!("Error creating console devices: {e:?}"))
         })?);
