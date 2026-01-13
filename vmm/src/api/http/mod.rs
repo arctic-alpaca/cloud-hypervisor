@@ -320,6 +320,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
         Box::new(VmActionHandler::new(&VmShutdown)),
     );
     r.routes.insert(
+        endpoint!("/vm.migration-progress"),
+        Box::new(VmMigrationProgress {}),
+    );
+    r.routes.insert(
         endpoint!("/vm.snapshot"),
         Box::new(VmActionHandler::new(&VmSnapshot)),
     );

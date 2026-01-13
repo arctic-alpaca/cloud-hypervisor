@@ -11,6 +11,7 @@ use std::thread;
 
 use libfuzzer_sys::{fuzz_target, Corpus};
 use micro_http::Request;
+use vm_migration::progress::MigrationProgress;
 use vm_migration::MigratableError;
 use vmm::api::http::*;
 use vmm::api::{

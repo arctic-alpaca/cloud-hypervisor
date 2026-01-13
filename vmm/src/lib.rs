@@ -21,6 +21,7 @@ use anyhow::{Context, anyhow};
 #[cfg(feature = "dbus_api")]
 use api::dbus::{DBusApiOptions, DBusApiShutdownChannels};
 use api::http::HttpApiHandle;
+use arch::PAGE_SIZE;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY;
 use console_devices::{ConsoleInfo, pre_create_console_devices};
@@ -38,6 +39,10 @@ use thiserror::Error;
 use tracer::trace_scoped;
 use vm_memory::GuestMemoryAtomic;
 use vm_memory::bitmap::AtomicBitmap;
+use vm_migration::progress::{
+    MemoryTransmissionInfo, MigrationProgress, MigrationState, MigrationStateOngoingPhase,
+    TransportationMode,
+};
 use vm_migration::protocol::*;
 use vm_migration::{
     MemoryMigrationContext, Migratable, MigratableError, OngoingMigrationContext, Pausable,
@@ -285,6 +290,9 @@ impl From<u64> for EpollDispatch {
         }
     }
 }
+
+// TODO make this a member of Vmm?
+static MIGRATION_PROGRESS_SNAPSHOT: Mutex<Option<MigrationProgress>> = Mutex::new(None);
 
 pub struct EpollContext {
     epoll_file: File,
@@ -1387,6 +1395,42 @@ impl Vmm {
         postponed_lifecycle_event: &Mutex<Option<PostponedLifecycleEvent>>,
         cancel_migration: &AtomicBool,
     ) -> result::Result<MemoryRangeTable /* remaining */, MigratableError> {
+        let total_memory_size_bytes = vm
+            .memory_range_table()?
+            .ranges()
+            .iter()
+            .map(|range| range.length)
+            .sum::<u64>();
+        let update_migration_progress = |s: &mut MemoryMigrationContext, vm: &Vm| {
+            let mut lock = MIGRATION_PROGRESS_SNAPSHOT.lock().unwrap();
+            lock.as_mut()
+                .expect("live migration should be ongoing")
+                .update(
+                    MigrationStateOngoingPhase::MemoryPrecopy,
+                    Some(MemoryTransmissionInfo {
+                        memory_iteration: s.iteration as u64,
+                        memory_transmission_bps: s.bandwidth_bytes_per_second as u64,
+                        memory_bytes_total: total_memory_size_bytes,
+                        memory_bytes_transmitted: s.total_sent_bytes,
+                        memory_pages_4k_transmitted: s.total_sent_bytes.div_ceil(PAGE_SIZE as u64),
+                        memory_pages_4k_remaining_iteration: s
+                            .current_iteration_total_bytes
+                            .div_ceil(PAGE_SIZE as u64),
+                        memory_bytes_remaining_iteration: s.current_iteration_total_bytes,
+                        memory_dirty_rate_pps: {
+                            let pages = s.current_iteration_total_bytes.div_ceil(PAGE_SIZE as u64);
+                            s.iteration_duration
+                                .filter(|d| !d.is_zero())
+                                .map(|d| (pages as f64 / d.as_secs_f64()).ceil())
+                                .map_or(0, |dirty_rate| dirty_rate as u64)
+                        },
+                        memory_pages_constant_count: 0, /* TODO */
+                    }),
+                    None,
+                    s.estimated_downtime,
+                );
+        };
+
         loop {
             let iteration_begin = Instant::now();
 
@@ -1398,6 +1442,8 @@ impl Vmm {
             };
 
             ctx.update_metrics_before_transfer(iteration_begin, &iteration_table);
+            // Update before we either exit the loop or transfer memory
+            update_migration_progress(ctx, vm);
             if is_converged(ctx)? {
                 debug!("Precopy converged: {ctx}");
                 break Ok(iteration_table);
@@ -1619,6 +1665,16 @@ impl Vmm {
             MigratableError::MigrateSend(anyhow!("Error starting migration")),
         )?;
 
+        // Signal that the migration connection has been established. Management
+        // software can use this to distinguish short send/receive races from a
+        // real migration startup failure.
+        {
+            let mut lock = MIGRATION_PROGRESS_SNAPSHOT.lock().unwrap();
+            lock.as_mut()
+                .expect("live migration should be ongoing")
+                .update(MigrationStateOngoingPhase::Started, None, None, None);
+        }
+
         // Send config
         let vm_config = vm.get_config();
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -1661,6 +1717,11 @@ impl Vmm {
         if send_data_migration.local {
             match &mut socket {
                 SocketStream::Unix(unix_socket) => {
+                    let mut lock = MIGRATION_PROGRESS_SNAPSHOT.lock().unwrap();
+                    lock.as_mut()
+                        .expect("live migration should be ongoing")
+                        .update(MigrationStateOngoingPhase::MemoryFds, None, None, None);
+
                     // Proceed with sending memory file descriptors over UNIX socket
                     vm.send_memory_fds(unix_socket)?;
                 }
@@ -1724,6 +1785,14 @@ impl Vmm {
             mem_send.cleanup()?;
         }
 
+        // Update migration progress snapshot
+        {
+            let mut lock = MIGRATION_PROGRESS_SNAPSHOT.lock().unwrap();
+            lock.as_mut()
+                .expect("live migration should be ongoing")
+                .update(MigrationStateOngoingPhase::Completing, None, None, None);
+        }
+
         // We release the locks early to enable locking them on the destination host.
         // The VM is already stopped.
         vm.release_disk_locks()
@@ -1775,6 +1844,14 @@ impl Vmm {
         // Stop logging dirty pages
         if !send_data_migration.local {
             vm.stop_dirty_log()?;
+        }
+
+        // Update migration progress snapshot
+        {
+            let mut lock = MIGRATION_PROGRESS_SNAPSHOT.lock().unwrap();
+            lock.as_mut()
+                .expect("live migration should be ongoing")
+                .mark_as_finished();
         }
 
         // Let every Migratable object know about the migration being complete
@@ -1965,6 +2042,14 @@ impl Vmm {
                     nested_error_to_flat_chain_as_string(&e)
                 );
                 try_resume_vm_after_failed_migration(vm);
+
+                // Update migration progress snapshot
+                {
+                    let mut lock = MIGRATION_PROGRESS_SNAPSHOT.lock().unwrap();
+                    lock.as_mut()
+                        .expect("live migration should be ongoing")
+                        .mark_as_failed(&e);
+                }
             }
         }
         self.clear_postponed_lifecycle_event();
@@ -3080,6 +3165,34 @@ impl RequestHandler for Vmm {
             .with_context(|| "Failed to clone check_migration_evt FD")
             .map_err(MigratableError::MigrateSend)?;
 
+        // Update migration progress snapshot early:
+        // We guarantee that migration statistics can be fetched as soon as SendMigration returns.
+        //
+        // If the migration fails, the state will later be updated accordingly.
+        {
+            let mut lock = MIGRATION_PROGRESS_SNAPSHOT.lock().unwrap();
+            if lock
+                .as_ref()
+                .map(|p| &p.state)
+                .is_some_and(|snapshot| matches!(snapshot, MigrationState::Ongoing { .. }))
+            {
+                // If this panic triggers, we made a programming error in our state handling.
+                panic!("migration already ongoing");
+            }
+            let transportation_mode = if send_data_migration.local {
+                TransportationMode::Local
+            } else {
+                TransportationMode::Tcp {
+                    connections: send_data_migration.connections,
+                    tls: send_data_migration.tls_dir.is_some(),
+                }
+            };
+            lock.replace(MigrationProgress::new(
+                transportation_mode,
+                send_data_migration.downtime(),
+            ));
+        }
+
         // Take VM ownership. This also means that API events can no longer
         // change the VM (e.g. net device hotplug).
         let vm = self
@@ -3105,9 +3218,26 @@ impl RequestHandler for Vmm {
             }
             Err(e) => {
                 self.vm = VmOwnership::Owned(e.vm);
-                Err(MigratableError::MigrateSend(e.spawn_error.into()))
+                let error = MigratableError::MigrateSend(e.spawn_error.into());
+
+                // The snapshot was already marked as ongoing above.
+                MIGRATION_PROGRESS_SNAPSHOT
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .expect("live migration should be ongoing")
+                    .mark_as_failed(&error);
+
+                Err(error)
             }
         }
+    }
+
+    fn vm_migration_progress(&mut self) -> Option<MigrationProgress> {
+        // We explicitly do not check here for `is VM running?` to always
+        // enable querying the state of the last failed migration.
+        let lock = MIGRATION_PROGRESS_SNAPSHOT.lock().unwrap();
+        lock.clone()
     }
 
     fn vm_disk_mirror_start(
