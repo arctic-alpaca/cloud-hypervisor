@@ -92,8 +92,8 @@ use virtio_devices::block::MirrorError;
 use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator, VirtioTransport};
 use virtio_devices::vhost_user::VhostUserConfig;
 use virtio_devices::{
-    AccessPlatformMapping, ActivateError, Block, Endpoint, IommuMapping, VdpaDmaMapping,
-    VirtioMemMappingSource,
+    AccessPlatformMapping, ActivateError, Block, Endpoint, IommuMapping, PostMigrationAnnouncer,
+    VdpaDmaMapping, VirtioMemMappingSource,
 };
 use vm_allocator::{AddressAllocator, InterruptAllocError, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
@@ -5592,6 +5592,49 @@ impl DeviceManager {
             .map_err(DeviceManagerError::BlockMirrorCancel)
     }
 
+    /// Helps the environment converge quickly after a live migration by
+    /// prompting devices to advertise the VM from its new host.
+    ///
+    /// This is mainly useful for networking: switches and peers can refresh
+    /// their view of where the guest now lives instead of waiting for normal
+    /// traffic to update MAC-to-port mappings on its own.
+    ///
+    /// The method gathers the [`PostMigrationAnnouncer`] implementations
+    /// exposed by virtio devices, runs one announcement synchronously for
+    /// minimum delay, and then schedules a few retries from a background
+    /// thread.
+    pub fn post_migration_announce(&self) {
+        let mut announcers: Vec<Box<dyn PostMigrationAnnouncer>> = self
+            .virtio_devices
+            .iter()
+            .filter_map(|dev| dev.virtio_device.lock().unwrap().post_migration_announcer())
+            .collect();
+
+        if announcers.is_empty() {
+            info!("No announcers");
+            return;
+        }
+
+        // We do the first announcement synchronously, because we want the announcements
+        // as soon as possible.
+        announcers.iter_mut().for_each(|a| a.announce());
+        info!("Post migration announce (sync)");
+
+        // For good measure we repeat the announcements. This increases the chance that
+        // the announcements have the expected effect.
+        const ROUNDS: u32 = 4;
+        const INITIAL_DELAY: Duration = Duration::from_millis(50);
+        const STEP_DELAY: Duration = Duration::from_millis(100);
+        const MAX_DELAY: Duration = Duration::from_millis(450);
+        schedule_post_migration_announcements(
+            announcers,
+            ROUNDS,
+            INITIAL_DELAY,
+            STEP_DELAY,
+            MAX_DELAY,
+        );
+    }
+
     /// Returns a list of devices for which a boot index was configured.
     #[cfg(all(target_arch = "x86_64", feature = "fw_cfg"))]
     pub fn boot_order_entries(&self) -> Vec<BootOrderEntry> {
@@ -5616,6 +5659,32 @@ impl DeviceManager {
                 warn!("Failed to cancel block mirror for {id}: {error}");
             });
     }
+}
+
+/// Starts a thread that periodically performs the post-migration announcements.
+fn schedule_post_migration_announcements(
+    mut announcers: Vec<Box<dyn PostMigrationAnnouncer>>,
+    rounds: u32,
+    initial_delay: Duration,
+    step_delay: Duration,
+    max_delay: Duration,
+) {
+    let _ = thread::Builder::new()
+        .name("post-migration-announcers".to_string())
+        .spawn(move || {
+            for round in 0..rounds {
+                info!("Post migration announce (async): {}/{}", round + 1, rounds);
+
+                // The first announcement already was done synchronously, thus
+                // we sleep at the start of the loop.
+
+                let delay = (initial_delay + step_delay.saturating_mul(round)).min(max_delay);
+                debug!("Sleeping {}ms", delay.as_millis());
+                thread::sleep(delay);
+
+                announcers.iter_mut().for_each(|a| a.announce());
+            }
+        });
 }
 
 #[cfg(feature = "ivshmem")]
