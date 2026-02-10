@@ -1970,6 +1970,10 @@ impl MemoryManager {
             // MPOL_BIND is the selected mode as it specifies a strict policy
             // that restricts memory allocation to the nodes specified in the
             // nodemask.
+            info!(
+                "Creating raw memory region: host-addr={:018x}, len={len}, mode={mode}, host-node={node}",
+                addr as u64
+            );
             Self::mbind(addr, len, mode, &nodemask, maxnode, flags)
                 .map_err(Error::ApplyNumaPolicy)?;
         }
