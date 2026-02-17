@@ -1209,7 +1209,6 @@ impl Vmm {
 
         let config = vm_migration_config.vm_config.clone();
         self.vm_config = Some(vm_migration_config.vm_config);
-
         if let Some(tcp_serial_url) = tcp_serial_url {
             let mut vm_config = self.vm_config.as_mut().unwrap().lock().unwrap();
             vm_config.serial.common.url = Some(tcp_serial_url);
@@ -1299,6 +1298,11 @@ impl Vmm {
                 .context("Error deserialising snapshot")
                 .map_err(MigratableError::MigrateReceive)
         })?;
+
+        let vm_snapshot = get_vm_snapshot(&snapshot)
+            .context("Failed extracting VM snapshot data")
+            .map_err(MigratableError::MigrateReceive)?;
+        self.received_postponed_lifecycle_event = vm_snapshot.post_migration_lifecycle_event;
 
         let exit_evt = self
             .exit_evt
@@ -2977,11 +2981,9 @@ impl RequestHandler for Vmm {
         // Accept the connection and get the socket
         let mut socket = listener
             .accept(true)
-            .context("Failed to accept migration connection")
-            .map_err(|e| {
-                warn!("{e}");
-                MigratableError::MigrateReceive(e)
-            })?;
+            .inspect_err(|e| warn!("{e}"))
+            .context("Failed to accept incoming migration")
+            .map_err(MigratableError::MigrateReceive)?;
 
         event!("vm", "migration-receive-started");
 
