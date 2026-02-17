@@ -110,11 +110,9 @@ use crate::landlock::LandlockError;
 use crate::memory_manager::{
     Error as MemoryManagerError, MemoryManager, MemoryManagerSnapshotData,
 };
-#[cfg(target_arch = "x86_64")]
-use crate::migration::get_vm_snapshot;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::migration::url_to_file;
-use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, url_to_path};
+use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapshot, url_to_path};
 #[cfg(all(
     feature = "kvm",
     feature = "sev_snp",
@@ -591,6 +589,13 @@ pub struct Vm {
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     stop_on_boot: bool,
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
+    post_migration_lifecycle_event: Option<PostponedLifecycleEvent>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PostponedLifecycleEvent {
+    VmReboot,
+    VmShutdown,
 }
 
 impl Vm {
@@ -749,6 +754,15 @@ impl Vm {
         } else {
             VmState::Created
         };
+        let post_migration_lifecycle_event = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                get_vm_snapshot(snapshot)
+                    .map(|vm_snapshot| vm_snapshot.post_migration_lifecycle_event)
+                    .map_err(Error::Restore)
+            })
+            .transpose()?
+            .flatten();
 
         Ok(Vm {
             #[cfg(feature = "tdx")]
@@ -769,6 +783,7 @@ impl Vm {
             hypervisor,
             stop_on_boot,
             load_payload_handle,
+            post_migration_lifecycle_event,
         })
     }
 
@@ -1463,6 +1478,17 @@ impl Vm {
         }
 
         Ok(numa_nodes)
+    }
+
+    /// Stores a lifecycle event until migration and active disk mirrors permit
+    /// it to be replayed.
+    pub fn set_post_migration_lifecycle_event(&mut self, event: Option<PostponedLifecycleEvent>) {
+        self.post_migration_lifecycle_event = event;
+    }
+
+    /// Returns the lifecycle event currently waiting to be replayed.
+    pub fn post_migration_lifecycle_event(&self) -> Option<PostponedLifecycleEvent> {
+        self.post_migration_lifecycle_event
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3492,6 +3518,8 @@ impl Pausable for Vm {
 
 #[derive(Serialize, Deserialize)]
 pub struct VmSnapshot {
+    #[serde(default)]
+    pub post_migration_lifecycle_event: Option<PostponedLifecycleEvent>,
     #[cfg(target_arch = "x86_64")]
     pub clock: Option<hypervisor::ClockData>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -3554,6 +3582,7 @@ impl Snapshottable for Vm {
         };
 
         let vm_snapshot_state = VmSnapshot {
+            post_migration_lifecycle_event: self.post_migration_lifecycle_event(),
             #[cfg(target_arch = "x86_64")]
             clock: self.saved_clock,
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
