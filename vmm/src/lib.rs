@@ -1393,6 +1393,16 @@ impl Vmm {
             // Increment iteration last: This way we ensure that the logging
             // above matches the actual iteration.
             ctx.iteration += 1;
+
+            let event = *postponed_lifecycle_event.lock().unwrap();
+            if let Some(event) = event {
+                info!(
+                    "Lifecycle event postponed during migration ({event:?}), switching to downtime phase early"
+                );
+                // The current iteration has already been sent, therefore no extra range
+                // needs to be carried into the final transfer batch.
+                break Ok(MemoryRangeTable::default());
+            }
         }
     }
 
