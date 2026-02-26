@@ -1705,7 +1705,7 @@ impl Vmm {
         transport::send_request_expect_ok(
             &mut socket,
             Request::start(),
-            MigratableError::MigrateSend(anyhow!("Error starting migration")),
+            MigratableError::MigrateSend(anyhow!("Error starting migration (got bad response)")),
         )?;
 
         // Signal that the migration connection has been established. Management
@@ -1752,9 +1752,8 @@ impl Vmm {
                     profile,
                 },
             )
-            .map_err(|e| {
-                MigratableError::MigrateSend(anyhow!("Error generating common cpuid': {e:?}"))
-            })?
+            .context("Error generating common cpuid")
+            .map_err(MigratableError::MigrateSend)?
         };
 
         if send_data_migration.local {
