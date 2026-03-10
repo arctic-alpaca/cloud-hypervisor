@@ -3453,6 +3453,9 @@ impl Vm {
             .post_migration_announce();
     }
 
+    pub fn device_manager(&self) -> &Arc<Mutex<DeviceManager>> {
+        &self.device_manager
+    }
 }
 
 impl Pausable for Vm {
