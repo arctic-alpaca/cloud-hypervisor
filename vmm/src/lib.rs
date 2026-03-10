@@ -1631,7 +1631,7 @@ impl SendAdditionalConnections {
         // because we wait for a response after each chunk instead of sending
         // everything in one go.
         if thread_len == 0 {
-            for chunk in table.partition(Self::CHUNK_SIZE) {
+            for chunk in table.partition(Self::CHUNK_SIZE, &self.guest_memory) {
                 return_if_cancelled_cb(socket)
                     .inspect_err(|_| info!("cancelling migration during memory iteration"))?;
                 vm_send_memory(&self.guest_memory, socket, &chunk)?;
@@ -1641,7 +1641,7 @@ impl SendAdditionalConnections {
 
         // The chunk size is chosen to be big enough so that even very fast
         // links need some milliseconds to send it.
-        'next_chunk: for chunk in table.partition(Self::CHUNK_SIZE) {
+        'next_chunk: for chunk in table.partition(Self::CHUNK_SIZE, &self.guest_memory) {
             let mut chunk = SendMemoryThreadMessage::Memory(chunk);
             // The channel we put work into has a limited size. Thus it may happen that we have to
             // retry putting this chunk into it.

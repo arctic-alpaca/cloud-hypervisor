@@ -76,9 +76,13 @@
 
 use std::io::{Read, Write};
 
+use arch::PAGE_SIZE;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use vm_memory::ByteValued;
+use vm_memory::bitmap::AtomicBitmap;
+use vm_memory::{
+    Address, ByteValued, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
+};
 
 use crate::MigratableError;
 use crate::bitpos_iterator::BitposIteratorExt;
@@ -282,22 +286,88 @@ pub struct MemoryRangeTable {
     data: Vec<MemoryRange>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct MemoryRangeTableIterator {
+#[derive(Debug, Clone)]
+struct MemoryRangeTableIterator<'a> {
     chunk_size: u64,
     data: Vec<MemoryRange>,
+    zero_removed_data: Vec<MemoryRange>,
+    guest_memory: &'a GuestMemoryAtomic<vm_memory::GuestMemoryMmap<AtomicBitmap>>,
 }
 
-impl MemoryRangeTableIterator {
-    pub fn new(table: &MemoryRangeTable, chunk_size: u64) -> Self {
+impl<'a> MemoryRangeTableIterator<'a> {
+    pub fn new(
+        table: &MemoryRangeTable,
+        chunk_size: u64,
+        guest_memory: &'a GuestMemoryAtomic<vm_memory::GuestMemoryMmap<AtomicBitmap>>,
+    ) -> Self {
         MemoryRangeTableIterator {
             chunk_size,
             data: table.data.clone(),
+            zero_removed_data: Vec::new(),
+            guest_memory,
         }
     }
 }
 
-impl Iterator for MemoryRangeTableIterator {
+/// Removes all pages from `memory_range` that are completely filled with zeroes.
+///
+/// The resulting sub-ranges are added to `zero_removed_data`.
+///
+/// # Panics
+///
+/// Panics if `memory_range` is not valid for `guest_memory`.
+fn remove_zero_pages(
+    mut memory_range: MemoryRange,
+    zero_removed_data: &mut Vec<MemoryRange>,
+    guest_memory: &GuestMemoryAtomic<vm_memory::GuestMemoryMmap<AtomicBitmap>>,
+) {
+    // `memory_range` is trimmed to start at a page boundary and its length to be a multiple of the page size.
+
+    // Trim guest physical address to page boundary.
+    let page_offset = memory_range.gpa % PAGE_SIZE as u64;
+    if page_offset != 0 {
+        zero_removed_data.push(MemoryRange {
+            gpa: memory_range.gpa,
+            length: page_offset,
+        });
+        memory_range.gpa += page_offset;
+        memory_range.length -= page_offset;
+    }
+
+    // Trim length to be a multiple of the page size.
+    let page_overshoot = memory_range.length % PAGE_SIZE as u64;
+    if page_overshoot != 0 {
+        zero_removed_data.push(MemoryRange {
+            gpa: memory_range.gpa + memory_range.length - page_overshoot,
+            length: page_overshoot,
+        });
+        memory_range.length -= page_overshoot;
+    }
+
+    for page_start in (memory_range.gpa..memory_range.gpa + memory_range.length).step_by(PAGE_SIZE)
+    {
+        let mem = guest_memory.memory();
+        let volatile_slice = mem
+            .get_slice(GuestAddress::new(page_start), PAGE_SIZE)
+            .unwrap();
+        let slice_ptr = volatile_slice.ptr_guard().as_ptr();
+        static ZERO_PAGE: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+
+        // SAFETY: Both pointers point to valid memory of length `PAGE_SIZE` and neither are modified by `memcmp`.
+        let page_is_zero =
+            unsafe { libc::memcmp(slice_ptr as _, &raw const ZERO_PAGE as _, PAGE_SIZE) };
+
+        // TODO: Combine multiple non-zero pages into a single `MemoryRange`.
+        if page_is_zero != 0 {
+            zero_removed_data.push(MemoryRange {
+                gpa: page_start,
+                length: PAGE_SIZE as u64,
+            });
+        }
+    }
+}
+
+impl<'a> Iterator for MemoryRangeTableIterator<'a> {
     type Item = MemoryRangeTable;
 
     /// Return the next memory range in the table, making sure that
@@ -312,11 +382,19 @@ impl Iterator for MemoryRangeTableIterator {
         loop {
             assert!(ranges_size <= self.chunk_size);
 
-            if ranges_size == self.chunk_size || self.data.is_empty() {
+            if self.zero_removed_data.is_empty() {
+                if let Some(entry) = self.data.pop() {
+                    remove_zero_pages(entry, &mut self.zero_removed_data, self.guest_memory);
+                } else {
+                    break;
+                }
+            }
+
+            if ranges_size == self.chunk_size {
                 break;
             }
 
-            if let Some(range) = self.data.pop() {
+            if let Some(range) = self.zero_removed_data.pop() {
                 let next_range: MemoryRange = if ranges_size + range.length > self.chunk_size {
                     // How many bytes we need to put back into the table.
                     let leftover_bytes = ranges_size + range.length - self.chunk_size;
@@ -325,7 +403,7 @@ impl Iterator for MemoryRangeTableIterator {
                     assert!(returned_bytes <= range.length);
                     assert_eq!(leftover_bytes + returned_bytes, range.length);
 
-                    self.data.push(MemoryRange {
+                    self.zero_removed_data.push(MemoryRange {
                         gpa: range.gpa + returned_bytes,
                         length: leftover_bytes,
                     });
@@ -356,8 +434,12 @@ impl MemoryRangeTable {
     }
 
     /// Partitions the table into chunks of at most `chunk_size` bytes.
-    pub fn partition(&self, chunk_size: u64) -> impl Iterator<Item = MemoryRangeTable> {
-        MemoryRangeTableIterator::new(self, chunk_size)
+    pub fn partition(
+        &self,
+        chunk_size: u64,
+        guest_memory: &GuestMemoryAtomic<vm_memory::GuestMemoryMmap<AtomicBitmap>>,
+    ) -> impl Iterator<Item = MemoryRangeTable> {
+        MemoryRangeTableIterator::new(self, chunk_size, guest_memory)
     }
 
     /// Converts an iterator over a dirty bitmap into an iterator of dirty
@@ -463,6 +545,7 @@ impl MemoryRangeTable {
 #[cfg(test)]
 mod unit_tests {
     use crate::protocol::{MemoryRange, MemoryRangeTable};
+    use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
     #[test]
     fn test_memory_range_table_from_dirty_ranges_iter() {
@@ -521,11 +604,14 @@ mod unit_tests {
         ];
         assert_eq!(table.regions(), &expected_regions);
 
+        let temp = GuestMemoryMmap::new();
+        let temp2 = GuestMemoryAtomic::new(temp);
+
         // In the first test, we expect to see the exact same result as above, as we use the length
         // of every region (which is fixed!).
         {
             let chunks = table
-                .partition(page_size * 2)
+                .partition(page_size * 2, &temp2)
                 .map(|table| table.data)
                 .collect::<Vec<_>>();
 
@@ -548,10 +634,13 @@ mod unit_tests {
             );
         }
 
+        let temp = GuestMemoryMmap::new();
+        let temp2 = GuestMemoryAtomic::new(temp);
+
         // Next, we have a more sophisticated test with a chunk size of 5 pages.
         {
             let chunks = table
-                .partition(page_size * 5)
+                .partition(page_size * 5, &temp2)
                 .map(|table| table.data)
                 .collect::<Vec<_>>();
 
