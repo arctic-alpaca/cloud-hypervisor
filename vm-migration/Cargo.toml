@@ -14,5 +14,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 vm-memory = { workspace = true, features = ["backend-atomic", "backend-mmap"] }
 
+[dev-dependencies]
+vm-memory = { workspace = true, features = ["backend-bitmap"] }
+
 [lints]
 workspace = true
