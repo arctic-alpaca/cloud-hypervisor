@@ -320,35 +320,29 @@ where
     ///
     /// Panics if a memory range is not valid for [`MemoryRangeTableIterator::guest_memory`].
     fn fill_zero_removed_data(&mut self) -> bool {
-        if let Some(mut memory_range) = self.data.pop() {
+        if let Some(memory_range) = self.data.pop() {
             let page_size = self.zero_page.len();
+            // Avoids a bunch of `as u64` in the code.
+            let page_size_u64 = page_size as u64;
 
-            // `memory_range` is trimmed to start at a page boundary and its
-            // length to be a multiple of the page size.
+            // Offset from the memory range gpa to the first page boundary.
+            let gpa_page_offset = memory_range.gpa % page_size_u64;
+            // Amount of bytes by which the memory range overshoots the last page boundary.
+            let page_overshoot_length = (memory_range.length - gpa_page_offset) % page_size_u64;
 
-            // Trim guest physical address to page boundary.
-            let page_offset = memory_range.gpa % page_size as u64;
-            if page_offset != 0 {
-                self.zero_removed_data.push(MemoryRange {
-                    gpa: memory_range.gpa,
-                    length: page_offset,
-                });
-                memory_range.gpa += page_offset;
-                memory_range.length -= page_offset;
-            }
+            let first_page_boundary = memory_range.gpa + gpa_page_offset;
+            let last_page_boundary = memory_range.gpa + memory_range.length - page_overshoot_length;
+            let page_amount = (last_page_boundary - first_page_boundary) / page_size_u64;
 
-            // Trim length to be a multiple of the page size.
-            let page_overshoot = memory_range.length % page_size as u64;
-            if page_overshoot != 0 {
-                self.zero_removed_data.push(MemoryRange {
-                    gpa: memory_range.gpa + memory_range.length - page_overshoot,
-                    length: page_overshoot,
-                });
-                memory_range.length -= page_overshoot;
-            }
+            // The gpa of the memory range currently being built.
+            let mut current_gpa = memory_range.gpa;
+            // The length of memory range currently being built.
+            // Initially set to the page boundary offset which will be combined with the first
+            // page if it is non-zero or added to `zero_removed_data` if the next page is zero.
+            let mut current_length = gpa_page_offset;
 
             for page_start in
-                (memory_range.gpa..memory_range.gpa + memory_range.length).step_by(page_size)
+                (0..page_amount).map(|page_index| page_index * page_size_u64 + first_page_boundary)
             {
                 let mem = self.guest_memory.memory();
                 let volatile_slice = mem
@@ -365,14 +359,42 @@ where
                     libc::memcmp(slice_ptr.cast(), self.zero_page.as_ptr().cast(), page_size)
                 };
 
-                // TODO: Combine multiple non-zero pages into a single `MemoryRange`.
-                if page_is_zero != 0 {
-                    self.zero_removed_data.push(MemoryRange {
-                        gpa: page_start,
-                        length: page_size as u64,
-                    });
+                // If the current page is zero, we push all previous non-zero pages to
+                // `zero_removed_data` and set `current_gpa` to the end of the zero page while
+                // resetting the length.
+                if page_is_zero == 0 {
+                    if current_length != 0 {
+                        self.zero_removed_data.push(MemoryRange {
+                            gpa: current_gpa,
+                            length: current_length,
+                        });
+                    }
+                    current_gpa += current_length + page_size_u64;
+                    current_length = 0;
+                } else {
+                    current_length += page_size_u64;
                 }
             }
+
+            // If the current length is zero, the last page was a zero page.
+            if current_length == 0 {
+                if page_overshoot_length != 0 {
+                    self.zero_removed_data.push(MemoryRange {
+                        gpa: current_gpa,
+                        length: page_overshoot_length,
+                    });
+                }
+            } else {
+                // Add the overshoot if there is any.
+                if page_overshoot_length != 0 {
+                    current_length += page_overshoot_length;
+                }
+                self.zero_removed_data.push(MemoryRange {
+                    gpa: current_gpa,
+                    length: current_length,
+                });
+            }
+
             true
         } else {
             false
@@ -566,7 +588,7 @@ impl MemoryRangeTable {
 #[cfg(test)]
 mod unit_tests {
     use vm_memory::bitmap::AtomicBitmap;
-    use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
+    use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryAtomic, GuestMemoryMmap};
 
     use crate::protocol::{MemoryRange, MemoryRangeTable};
 
@@ -627,7 +649,22 @@ mod unit_tests {
         ];
         assert_eq!(table.regions(), &expected_regions);
 
-        let guest_memory_map: GuestMemoryMmap<AtomicBitmap> = GuestMemoryMmap::new();
+        let ranges = expected_regions
+            .clone()
+            .map(|range| (GuestAddress::new(range.gpa), range.length as usize));
+        let guest_memory_map: GuestMemoryMmap<AtomicBitmap> =
+            GuestMemoryMmap::from_ranges(&ranges).unwrap();
+        expected_regions.iter().for_each(|memory_range| {
+            let buffer = vec![1_u8; memory_range.length as usize];
+            let mut slice = buffer.as_slice();
+            guest_memory_map
+                .read_volatile_from(
+                    GuestAddress::new(memory_range.gpa),
+                    &mut slice,
+                    memory_range.length as usize,
+                )
+                .unwrap();
+        });
         let atomic_guest_memory_map = GuestMemoryAtomic::new(guest_memory_map);
 
         // In the first test, we expect to see the exact same result as above, as we use the length
@@ -657,7 +694,23 @@ mod unit_tests {
             );
         }
 
-        let guest_memory_map: GuestMemoryMmap<AtomicBitmap> = GuestMemoryMmap::new();
+        let ranges = expected_regions
+            .clone()
+            .map(|range| (GuestAddress(range.gpa), range.length as usize));
+
+        let guest_memory_map: GuestMemoryMmap<AtomicBitmap> =
+            GuestMemoryMmap::from_ranges(&ranges).unwrap();
+        expected_regions.iter().for_each(|memory_range| {
+            let buffer = vec![1_u8; memory_range.length as usize];
+            let mut slice = buffer.as_slice();
+            guest_memory_map
+                .read_volatile_from(
+                    GuestAddress::new(memory_range.gpa),
+                    &mut slice,
+                    memory_range.length as usize,
+                )
+                .unwrap();
+        });
         let atomic_guest_memory_map = GuestMemoryAtomic::new(guest_memory_map);
 
         // Next, we have a more sophisticated test with a chunk size of 5 pages.
