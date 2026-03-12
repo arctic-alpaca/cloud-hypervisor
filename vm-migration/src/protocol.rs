@@ -290,6 +290,7 @@ where
     chunk_size: u64,
     zero_page: Vec<u8>,
     data: Vec<MemoryRange>,
+    skip_zero_pages: bool,
     zero_removed_data: Vec<MemoryRange>,
     guest_memory: &'a M,
 }
@@ -302,14 +303,27 @@ where
         table: &MemoryRangeTable,
         chunk_size: u64,
         page_size: u64,
+        skip_zero_pages: bool,
         guest_memory: &'a M,
     ) -> Self {
-        MemoryRangeTableIterator {
-            chunk_size,
-            zero_page: vec![0; page_size as usize],
-            data: table.data.clone(),
-            zero_removed_data: Vec::new(),
-            guest_memory,
+        if skip_zero_pages {
+            MemoryRangeTableIterator {
+                chunk_size,
+                zero_page: vec![0; page_size as usize],
+                data: table.data.clone(),
+                skip_zero_pages,
+                zero_removed_data: Vec::new(),
+                guest_memory,
+            }
+        } else {
+            MemoryRangeTableIterator {
+                chunk_size,
+                zero_page: vec![0; 0],
+                data: Vec::new(),
+                skip_zero_pages,
+                zero_removed_data: table.data.clone(),
+                guest_memory,
+            }
         }
     }
 
@@ -320,6 +334,10 @@ where
     ///
     /// Panics if a memory range is not valid for [`MemoryRangeTableIterator::guest_memory`].
     fn fill_zero_removed_data(&mut self) -> bool {
+        if !self.skip_zero_pages {
+            return false;
+        }
+
         if let Some(memory_range) = self.data.pop() {
             let page_size = self.zero_page.len();
             // Avoids a bunch of `as u64` in the code.
@@ -477,12 +495,13 @@ impl MemoryRangeTable {
         &self,
         chunk_size: u64,
         page_size: u64,
+        skip_zero_pages: bool,
         guest_memory: &M,
     ) -> impl Iterator<Item = MemoryRangeTable>
     where
         M: GuestAddressSpace,
     {
-        MemoryRangeTableIterator::new(self, chunk_size, page_size, guest_memory)
+        MemoryRangeTableIterator::new(self, chunk_size, page_size, skip_zero_pages, guest_memory)
     }
 
     /// Converts an iterator over a dirty bitmap into an iterator of dirty
@@ -671,7 +690,7 @@ mod unit_tests {
         // of every region (which is fixed!).
         {
             let chunks = table
-                .partition(page_size * 2, page_size, &atomic_guest_memory_map)
+                .partition(page_size * 2, page_size, true, &atomic_guest_memory_map)
                 .map(|table| table.data)
                 .collect::<Vec<_>>();
 
@@ -716,7 +735,7 @@ mod unit_tests {
         // Next, we have a more sophisticated test with a chunk size of 5 pages.
         {
             let chunks = table
-                .partition(page_size * 5, page_size, &atomic_guest_memory_map)
+                .partition(page_size * 5, page_size, true, &atomic_guest_memory_map)
                 .map(|table| table.data)
                 .collect::<Vec<_>>();
 
