@@ -343,6 +343,10 @@ where
             // Avoids a bunch of `as u64` in the code.
             let page_size_u64 = page_size as u64;
 
+            // As far as I can tell, `MemoryRange` should always start and end on page boundaries,
+            // but there are not type-level guarantees, so we handle page boundaries and overshoot
+            // to be safe.
+
             // Offset from the memory range gpa to the first page boundary.
             let gpa_page_offset = memory_range.gpa % page_size_u64;
             // Amount of bytes by which the memory range overshoots the last page boundary.
@@ -366,16 +370,17 @@ where
                 let volatile_slice = mem
                     .get_slice(GuestAddress::new(page_start), page_size)
                     .unwrap();
-                let slice_ptr = volatile_slice.ptr_guard().as_ptr();
+                let slice_ptr = volatile_slice.ptr_guard();
+                // Shadow `slice_ptr` so the guard isn't dropped until the end of the scope.
+                let slice_ptr = slice_ptr.as_ptr().cast();
+                let zero_page_ptr = self.zero_page.as_ptr().cast();
 
                 // Potential data races between the guest writing to memory and the check whether
                 // a page is all zero are handled by the page dirty logging.
                 // SAFETY: Both pointers point to valid memory of length `PAGE_SIZE` and
                 // neither are modified by `memcmp`.
                 // See: https://man7.org/linux/man-pages/man3/memcmp.3.html
-                let page_is_zero = unsafe {
-                    libc::memcmp(slice_ptr.cast(), self.zero_page.as_ptr().cast(), page_size)
-                };
+                let page_is_zero = unsafe { libc::memcmp(slice_ptr, zero_page_ptr, page_size) };
 
                 // If the current page is zero, we push all previous non-zero pages to
                 // `zero_removed_data` and set `current_gpa` to the end of the zero page while
@@ -673,24 +678,13 @@ mod unit_tests {
             .map(|range| (GuestAddress::new(range.gpa), range.length as usize));
         let guest_memory_map: GuestMemoryMmap<AtomicBitmap> =
             GuestMemoryMmap::from_ranges(&ranges).unwrap();
-        expected_regions.iter().for_each(|memory_range| {
-            let buffer = vec![1_u8; memory_range.length as usize];
-            let mut slice = buffer.as_slice();
-            guest_memory_map
-                .read_volatile_from(
-                    GuestAddress::new(memory_range.gpa),
-                    &mut slice,
-                    memory_range.length as usize,
-                )
-                .unwrap();
-        });
         let atomic_guest_memory_map = GuestMemoryAtomic::new(guest_memory_map);
 
         // In the first test, we expect to see the exact same result as above, as we use the length
         // of every region (which is fixed!).
         {
             let chunks = table
-                .partition(page_size * 2, page_size, true, &atomic_guest_memory_map)
+                .partition(page_size * 2, page_size, false, &atomic_guest_memory_map)
                 .map(|table| table.data)
                 .collect::<Vec<_>>();
 
@@ -719,23 +713,12 @@ mod unit_tests {
 
         let guest_memory_map: GuestMemoryMmap<AtomicBitmap> =
             GuestMemoryMmap::from_ranges(&ranges).unwrap();
-        expected_regions.iter().for_each(|memory_range| {
-            let buffer = vec![1_u8; memory_range.length as usize];
-            let mut slice = buffer.as_slice();
-            guest_memory_map
-                .read_volatile_from(
-                    GuestAddress::new(memory_range.gpa),
-                    &mut slice,
-                    memory_range.length as usize,
-                )
-                .unwrap();
-        });
         let atomic_guest_memory_map = GuestMemoryAtomic::new(guest_memory_map);
 
         // Next, we have a more sophisticated test with a chunk size of 5 pages.
         {
             let chunks = table
-                .partition(page_size * 5, page_size, true, &atomic_guest_memory_map)
+                .partition(page_size * 5, page_size, false, &atomic_guest_memory_map)
                 .map(|table| table.data)
                 .collect::<Vec<_>>();
 
@@ -776,5 +759,195 @@ mod unit_tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn test_memory_range_table_skip_zero_pages_all() {
+        let input = [0b11_0011_0011_0011];
+
+        let start_gpa = 0x1000;
+        let page_size = 0x1000;
+
+        let table = MemoryRangeTable::from_dirty_bitmap(input, start_gpa, page_size);
+        let expected_regions = [
+            MemoryRange {
+                gpa: start_gpa,
+                length: page_size * 2,
+            },
+            MemoryRange {
+                gpa: start_gpa + 4 * page_size,
+                length: page_size * 2,
+            },
+            MemoryRange {
+                gpa: start_gpa + 8 * page_size,
+                length: page_size * 2,
+            },
+            MemoryRange {
+                gpa: start_gpa + 12 * page_size,
+                length: page_size * 2,
+            },
+        ];
+        assert_eq!(table.regions(), &expected_regions);
+
+        let ranges = expected_regions
+            .clone()
+            .map(|range| (GuestAddress::new(range.gpa), range.length as usize));
+        let guest_memory_map: GuestMemoryMmap<AtomicBitmap> =
+            GuestMemoryMmap::from_ranges(&ranges).unwrap();
+        let atomic_guest_memory_map = GuestMemoryAtomic::new(guest_memory_map);
+
+        let chunks = table
+            .partition(page_size * 2, page_size, true, &atomic_guest_memory_map)
+            .map(|table| table.data)
+            .collect::<Vec<_>>();
+
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_memory_range_table_skip_zero_pages_some() {
+        let input = [0b11_0011_0011_0011];
+
+        let start_gpa = 0x1000;
+        let page_size = 0x1000;
+
+        let table = MemoryRangeTable::from_dirty_bitmap(input, start_gpa, page_size);
+        let expected_regions = [
+            MemoryRange {
+                gpa: start_gpa,
+                length: page_size * 2,
+            },
+            MemoryRange {
+                gpa: start_gpa + 4 * page_size,
+                length: page_size * 2,
+            },
+            MemoryRange {
+                gpa: start_gpa + 8 * page_size,
+                length: page_size * 2,
+            },
+            MemoryRange {
+                gpa: start_gpa + 12 * page_size,
+                length: page_size * 2,
+            },
+        ];
+        assert_eq!(table.regions(), &expected_regions);
+
+        let ranges = expected_regions
+            .clone()
+            .map(|range| (GuestAddress(range.gpa), range.length as usize));
+
+        let guest_memory_map: GuestMemoryMmap<AtomicBitmap> =
+            GuestMemoryMmap::from_ranges(&ranges).unwrap();
+        expected_regions.iter().step_by(2).for_each(|memory_range| {
+            let buffer = vec![1_u8; memory_range.length as usize];
+            let mut slice = buffer.as_slice();
+            guest_memory_map
+                .read_volatile_from(
+                    GuestAddress::new(memory_range.gpa),
+                    &mut slice,
+                    memory_range.length as usize,
+                )
+                .unwrap();
+        });
+        let atomic_guest_memory_map = GuestMemoryAtomic::new(guest_memory_map);
+
+        // Use a large chunk_size to only return one vector.
+        let chunks = table
+            .partition(page_size * 20, page_size, true, &atomic_guest_memory_map)
+            .map(|table| table.data)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            chunks,
+            &[vec![
+                MemoryRange {
+                    gpa: start_gpa + 8 * page_size,
+                    length: page_size * 2,
+                },
+                MemoryRange {
+                    gpa: start_gpa,
+                    length: page_size * 2,
+                },
+            ],]
+        );
+    }
+
+    #[test]
+    fn test_memory_range_table_skip_zero_pages_within_range() {
+        let input = [0b11_0011_0011_0011];
+
+        let start_gpa = 0x1000;
+        let page_size = 0x1000;
+
+        let table = MemoryRangeTable::from_dirty_bitmap(input, start_gpa, page_size);
+        let expected_regions = [
+            MemoryRange {
+                gpa: start_gpa,
+                length: page_size * 2,
+            },
+            MemoryRange {
+                gpa: start_gpa + 4 * page_size,
+                length: page_size * 2,
+            },
+            MemoryRange {
+                gpa: start_gpa + 8 * page_size,
+                length: page_size * 2,
+            },
+            MemoryRange {
+                gpa: start_gpa + 12 * page_size,
+                length: page_size * 2,
+            },
+        ];
+        assert_eq!(table.regions(), &expected_regions);
+
+        let ranges = expected_regions
+            .clone()
+            .map(|range| (GuestAddress(range.gpa), range.length as usize));
+
+        let guest_memory_map: GuestMemoryMmap<AtomicBitmap> =
+            GuestMemoryMmap::from_ranges(&ranges).unwrap();
+        expected_regions.iter().for_each(|memory_range| {
+            let page_amount = memory_range.length / page_size;
+            let buffer = vec![1_u8; page_size as usize];
+            let mut slice = buffer.as_slice();
+            for page_index in 0..page_amount {
+                guest_memory_map
+                    .read_volatile_from(
+                        GuestAddress::new(memory_range.gpa + page_index * page_size),
+                        &mut slice,
+                        page_size as usize,
+                    )
+                    .unwrap();
+            }
+        });
+        let atomic_guest_memory_map = GuestMemoryAtomic::new(guest_memory_map);
+
+        // Use a large chunk_size to only return one vector.
+        let chunks = table
+            .partition(page_size * 20, page_size, true, &atomic_guest_memory_map)
+            .map(|table| table.data)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            chunks,
+            &[vec![
+                MemoryRange {
+                    gpa: 53248,
+                    length: 4096
+                },
+                MemoryRange {
+                    gpa: 36864,
+                    length: 4096
+                },
+                MemoryRange {
+                    gpa: 20480,
+                    length: 4096
+                },
+                MemoryRange {
+                    gpa: 4096,
+                    length: 4096
+                }
+            ],]
+        );
     }
 }
