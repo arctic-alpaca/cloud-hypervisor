@@ -310,6 +310,9 @@ pub struct VmSendMigrationData {
     pub tls_dir: Option<PathBuf>,
     /// Keep the VMM alive.
     pub keep_alive: bool,
+
+    /// TODO
+    pub omit_zero_pages: bool,
 }
 
 // Default value for downtime the same as qemu.

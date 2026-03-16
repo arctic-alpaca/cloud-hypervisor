@@ -2444,6 +2444,7 @@ impl Vmm {
         migrate_downtime_limit: Duration,
         postponed_lifecycle_event: &Mutex<Option<PostMigrationLifecycleEvent>>,
         return_if_cancelled_cb: &impl Fn(&mut SocketStream) -> result::Result<(), MigratableError>,
+        omit_zero_pages: bool,
     ) -> result::Result<MemoryRangeTable, MigratableError> {
         let mut iteration_table;
         let total_memory_size_bytes = vm
@@ -2580,7 +2581,7 @@ impl Vmm {
             // Only skip zero pages on first iteration.
             // If we skip dirty logged zero pages, we don't send newly zeroed pages to the
             // destination.
-            let skip_zero_pages = s.iteration == 0;
+            let skip_zero_pages = s.iteration == 0 && omit_zero_pages;
             mem_send.send_memory(
                 &iteration_table,
                 skip_zero_pages,
@@ -2625,6 +2626,7 @@ impl Vmm {
         send_data_migration: &VmSendMigrationData,
         postponed_lifecycle_event: &Mutex<Option<PostMigrationLifecycleEvent>>,
         return_if_cancelled_cb: &impl Fn(&mut SocketStream) -> result::Result<(), MigratableError>,
+        omit_zero_pages: bool,
     ) -> result::Result<(), MigratableError> {
         let mem_send = SendAdditionalConnections::new(send_data_migration, &vm.guest_memory())?;
 
@@ -2662,6 +2664,7 @@ impl Vmm {
             migrate_downtime_limit,
             postponed_lifecycle_event,
             return_if_cancelled_cb,
+            omit_zero_pages,
         )?;
 
         info!("Entering downtime phase");
@@ -2834,6 +2837,7 @@ impl Vmm {
                 send_data_migration,
                 postponed_lifecycle_event,
                 &return_if_cancelled_cb,
+                send_data_migration.omit_zero_pages,
             )?;
         }
 
