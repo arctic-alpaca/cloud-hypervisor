@@ -2628,6 +2628,8 @@ impl Vmm {
         return_if_cancelled_cb: &impl Fn(&mut SocketStream) -> result::Result<(), MigratableError>,
         omit_zero_pages: bool,
     ) -> result::Result<(), MigratableError> {
+        let migration_start = std::time::Instant::now();
+
         let mem_send = SendAdditionalConnections::new(send_data_migration, &vm.guest_memory())?;
 
         // Define the maximum allowed downtime 2000 seconds(2000000 milliseconds)
@@ -2688,8 +2690,10 @@ impl Vmm {
         s.total_transferred_bytes += s.bytes_to_transmit;
         s.total_transferred_pages += s.pages_to_transmit;
 
+        let migration_duration = migration_start.elapsed();
         info!(
-            "Memory Migration finished: iter={},throttle={}%,size={}MiB,dirtyrate={}pps,bandwidth={:.2}MiBs,downtime(expected)={}ms",
+            "Memory Migration finished: took={}ms,iter={},throttle={}%,size={}MiB,dirtyrate={}pps,bandwidth={:.2}MiBs,downtime(expected)={}ms",
+            migration_duration.as_millis(),
             (s.iteration_duration - s.transmit_duration).as_millis(),
             vm.throttle_percent(),
             s.bytes_to_transmit.div_ceil(1024).div_ceil(1024),
