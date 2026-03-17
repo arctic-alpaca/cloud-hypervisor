@@ -1059,11 +1059,13 @@ impl ReceiveListener {
     fn accept(&mut self) -> std::result::Result<SocketStream, std::io::Error> {
         match self {
             ReceiveListener::Tcp(listener) => {
-                Self::accept_with_timeout(listener, Self::TIMEOUT_DURATION).map(|(socket, _)| {
-                    //socket.set_read_timeout(Some(Self::TIMEOUT_DURATION))?;
-                    //socket.set_write_timeout(Some(Self::TIMEOUT_DURATION))?;
-                    Ok(SocketStream::Tcp(socket))
-                })?
+                Self::accept_with_timeout(listener, Duration::from_mins(15)).map(
+                    |(socket, _)| {
+                        //socket.set_read_timeout(Some(Self::TIMEOUT_DURATION))?;
+                        //socket.set_write_timeout(Some(Self::TIMEOUT_DURATION))?;
+                        Ok(SocketStream::Tcp(socket))
+                    },
+                )?
             }
             ReceiveListener::Unix(listener, opt_path) => {
                 let socket = listener
@@ -1082,14 +1084,16 @@ impl ReceiveListener {
                 Ok(socket)
             }
             ReceiveListener::Tls(listener, conn) => {
-                Self::accept_with_timeout(listener, Self::TIMEOUT_DURATION).map(|(socket, _)| {
-                    //socket.set_read_timeout(Some(Self::TIMEOUT_DURATION))?;
-                    //socket.set_write_timeout(Some(Self::TIMEOUT_DURATION))?;
-                    conn.wrap(socket)
-                        .map(Box::new)
-                        .map(SocketStream::Tls)
-                        .map_err(std::io::Error::other)
-                })?
+                Self::accept_with_timeout(listener, Duration::from_mins(15)).map(
+                    |(socket, _)| {
+                        //socket.set_read_timeout(Some(Self::TIMEOUT_DURATION))?;
+                        //socket.set_write_timeout(Some(Self::TIMEOUT_DURATION))?;
+                        conn.wrap(socket)
+                            .map(Box::new)
+                            .map(SocketStream::Tls)
+                            .map_err(std::io::Error::other)
+                    },
+                )?
             }
         }
     }
