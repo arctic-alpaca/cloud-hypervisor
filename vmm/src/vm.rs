@@ -3206,10 +3206,9 @@ impl Vm {
                     MigratableError::MigrateSend(anyhow!("Error sending memory fd: {e}"))
                 })?;
 
-            Response::read_from(socket)?.ok_or_abandon(
-                socket,
-                MigratableError::MigrateSend(anyhow!("Error during memory fd migration")),
-            )?;
+            Response::read_from(socket)?.ok_or_error(MigratableError::MigrateSend(anyhow!(
+                "Error during memory fd migration"
+            )))?;
         }
 
         Ok(())
