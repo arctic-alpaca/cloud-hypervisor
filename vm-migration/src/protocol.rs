@@ -77,6 +77,7 @@
 use std::io::{Read, Write};
 
 use itertools::Itertools;
+use log::error;
 use serde::{Deserialize, Serialize};
 use vm_memory::{Address, ByteValued, GuestAddress, GuestAddressSpace, GuestMemory};
 
@@ -184,6 +185,9 @@ impl Request {
     pub fn read_from(fd: &mut dyn Read) -> Result<Request, MigratableError> {
         let mut request = Request::default();
         fd.read_exact(Self::as_mut_slice(&mut request))
+            .inspect_err(|error| {
+                error!("{error:?}");
+            })
             .map_err(MigratableError::MigrateSocket)?;
 
         Ok(request)
@@ -191,6 +195,9 @@ impl Request {
 
     pub fn write_to(&self, fd: &mut dyn Write) -> Result<(), MigratableError> {
         fd.write_all(Self::as_slice(self))
+            .inspect_err(|error| {
+                error!("{error:?}");
+            })
             .map_err(MigratableError::MigrateSocket)
     }
 }
@@ -243,6 +250,9 @@ impl Response {
     pub fn read_from(fd: &mut dyn Read) -> Result<Response, MigratableError> {
         let mut response = Response::default();
         fd.read_exact(Self::as_mut_slice(&mut response))
+            .inspect_err(|error| {
+                error!("{error:?}");
+            })
             .map_err(MigratableError::MigrateSocket)?;
 
         Ok(response)
@@ -266,6 +276,9 @@ impl Response {
 
     pub fn write_to(&self, fd: &mut dyn Write) -> Result<(), MigratableError> {
         fd.write_all(Self::as_slice(self))
+            .inspect_err(|error| {
+                error!("{error:?}");
+            })
             .map_err(MigratableError::MigrateSocket)
     }
 }

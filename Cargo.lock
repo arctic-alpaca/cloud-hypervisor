@@ -2807,6 +2807,7 @@ dependencies = [
  "anyhow",
  "itertools 0.14.0",
  "libc",
+ "log",
  "rustls",
  "serde",
  "serde_json",

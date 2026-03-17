@@ -2230,6 +2230,9 @@ impl Vmm {
         data.resize_with(req.length() as usize, Default::default);
         socket
             .read_exact(&mut data)
+            .inspect_err(|error| {
+                error!("{error:?}");
+            })
             .map_err(MigratableError::MigrateSocket)?;
 
         let vm_migration_config: VmMigrationConfig = serde_json::from_slice(&data)
@@ -2356,6 +2359,9 @@ impl Vmm {
         data.resize_with(req.length() as usize, Default::default);
         socket
             .read_exact(&mut data)
+            .inspect_err(|error| {
+                error!("{error:?}");
+            })
             .map_err(MigratableError::MigrateSocket)?;
         let snapshot: Snapshot = serde_json::from_slice(&data)
             .context("Error deserialising snapshot")
@@ -2824,6 +2830,9 @@ impl Vmm {
         Request::config(config_data.len() as u64).write_to(&mut socket)?;
         socket
             .write_all(&config_data)
+            .inspect_err(|error| {
+                error!("{error:?}");
+            })
             .map_err(MigratableError::MigrateSocket)?;
         Response::read_from(&mut socket)?.ok_or_abandon(
             &mut socket,
@@ -2882,6 +2891,9 @@ impl Vmm {
         Request::state(snapshot_data.len() as u64).write_to(&mut socket)?;
         socket
             .write_all(&snapshot_data)
+            .inspect_err(|error| {
+                error!("{error:?}");
+            })
             .map_err(MigratableError::MigrateSocket)?;
         Response::read_from(&mut socket)?.ok_or_abandon(
             &mut socket,
