@@ -2659,7 +2659,11 @@ impl RequestHandler for Vmm {
             receive_data_migration.tls_dir.as_deref(),
         )?;
         // Accept the connection and get the socket
-        let mut socket = listener.accept()?;
+        let mut socket = listener
+            .accept(true)
+            .inspect_err(|e| warn!("{e}"))
+            .context("Failed to accept incoming migration")
+            .map_err(MigratableError::MigrateReceive)?;
 
         event!("vm", "migration-receive-started");
 
