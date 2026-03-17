@@ -1222,16 +1222,23 @@ impl ReceiveAdditionalConnections {
             // driving the migration to completion, this is not a major concern.
             // In the long run, it would be preferable to move I/O to
             // asynchronous tasks to be able to handle aborts more gracefully.
-
-            let req = match Request::read_from(socket) {
-                Ok(req) => req,
-                Err(MigratableError::MigrateSocket(io_error))
-                    if io_error.kind() == ErrorKind::UnexpectedEof =>
-                {
-                    debug!("Connection closed by peer");
-                    return Ok(());
+            let req = loop {
+                match Request::read_from(socket) {
+                    Ok(req) => break req,
+                    Err(MigratableError::MigrateSocket(io_error))
+                        if io_error.kind() == ErrorKind::UnexpectedEof =>
+                    {
+                        debug!("Connection closed by peer");
+                        return Ok(());
+                    }
+                    Err(MigratableError::MigrateSocket(io_error))
+                        if io_error.kind() == ErrorKind::ResourceBusy =>
+                    {
+                        debug!("Resource busy, retrying");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             };
 
             if req.command() != Command::Memory {
