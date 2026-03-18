@@ -2497,6 +2497,7 @@ impl Vmm {
         migrate_downtime_limit: Duration,
         postponed_lifecycle_event: &Mutex<Option<PostMigrationLifecycleEvent>>,
         return_if_cancelled_cb: &impl Fn(&mut SocketStream) -> result::Result<(), MigratableError>,
+        skip_zero_pages: bool,
     ) -> result::Result<MemoryRangeTable, MigratableError> {
         let mut iteration_table;
         let total_memory_size_bytes = vm
@@ -2633,7 +2634,7 @@ impl Vmm {
             // Only skip zero pages on first iteration.
             // If we skip dirty logged zero pages, we don't send newly zeroed pages to the
             // destination.
-            let skip_zero_pages = s.iteration == 0;
+            let skip_zero_pages = s.iteration == 0 && skip_zero_pages;
             mem_send.send_memory(
                 &iteration_table,
                 skip_zero_pages,
@@ -2715,6 +2716,7 @@ impl Vmm {
             migrate_downtime_limit,
             postponed_lifecycle_event,
             return_if_cancelled_cb,
+            send_data_migration.skip_zero_pages,
         )?;
 
         info!("Entering downtime phase");
@@ -2738,8 +2740,10 @@ impl Vmm {
         s.total_transferred_bytes += s.bytes_to_transmit;
         s.total_transferred_pages += s.pages_to_transmit;
 
+        let migration_duration = s.migration_start_time.elapsed();
         info!(
-            "Memory Migration finished: iter={},throttle={}%,size={}MiB,dirtyrate={}pps,bandwidth={:.2}MiBs,downtime(expected)={}ms",
+            "Memory Migration finished: took={}ms,iter={},throttle={}%,size={}MiB,dirtyrate={}pps,bandwidth={:.2}MiBs,downtime(expected)={}ms",
+            migration_duration.as_millis(),
             (s.iteration_duration - s.transmit_duration).as_millis(),
             vm.throttle_percent(),
             s.bytes_to_transmit.div_ceil(1024).div_ceil(1024),
