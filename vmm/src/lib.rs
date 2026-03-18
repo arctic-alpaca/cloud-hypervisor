@@ -1681,6 +1681,7 @@ impl SendAdditionalConnections {
     fn send_memory(
         &self,
         table: &MemoryRangeTable,
+        skip_zero_pages: bool,
         socket: &mut SocketStream,
         return_if_cancelled_cb: &impl Fn(&mut SocketStream) -> result::Result<(), MigratableError>,
     ) -> std::result::Result<(), MigratableError> {
@@ -1691,7 +1692,12 @@ impl SendAdditionalConnections {
         // because we wait for a response after each chunk instead of sending
         // everything in one go.
         if thread_len == 0 {
-            for chunk in table.partition(Self::CHUNK_SIZE) {
+            for chunk in table.partition(
+                Self::CHUNK_SIZE,
+                PAGE_SIZE as u64,
+                skip_zero_pages,
+                &self.guest_memory,
+            ) {
                 return_if_cancelled_cb(socket)
                     .inspect_err(|_| info!("cancelling migration during memory iteration"))?;
                 vm_send_memory(&self.guest_memory, socket, &chunk)?;
@@ -1701,7 +1707,12 @@ impl SendAdditionalConnections {
 
         // The chunk size is chosen to be big enough so that even very fast
         // links need some milliseconds to send it.
-        'next_chunk: for chunk in table.partition(Self::CHUNK_SIZE) {
+        'next_chunk: for chunk in table.partition(
+            Self::CHUNK_SIZE,
+            PAGE_SIZE as u64,
+            skip_zero_pages,
+            &self.guest_memory,
+        ) {
             let mut chunk = SendMemoryThreadMessage::Memory(chunk);
             // The channel we put work into has a limited size. Thus it may happen that we have to
             // retry putting this chunk into it.
@@ -2619,7 +2630,16 @@ impl Vmm {
 
             // Send the current dirty pages
             s.transmit_start_time = Instant::now();
-            mem_send.send_memory(&iteration_table, socket, return_if_cancelled_cb)?;
+            // Only skip zero pages on first iteration.
+            // If we skip dirty logged zero pages, we don't send newly zeroed pages to the
+            // destination.
+            let skip_zero_pages = s.iteration == 0;
+            mem_send.send_memory(
+                &iteration_table,
+                skip_zero_pages,
+                socket,
+                return_if_cancelled_cb,
+            )?;
             s.transmit_duration = s.transmit_start_time.elapsed();
 
             s.total_transferred_bytes += s.bytes_to_transmit;
@@ -2710,7 +2730,7 @@ impl Vmm {
         // Send last batch of dirty pages
         let mut final_table = vm.dirty_log()?;
         final_table.extend(iteration_table.clone());
-        mem_send.send_memory(&final_table, socket, return_if_cancelled_cb)?;
+        mem_send.send_memory(&final_table, false, socket, return_if_cancelled_cb)?;
 
         // Update statistics
         s.bytes_to_transmit = final_table.regions().iter().map(|range| range.length).sum();
