@@ -29,7 +29,6 @@ use linux_loader::loader::elf::start_info::{
     hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
 };
 use log::{debug, error, info};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
@@ -192,7 +191,7 @@ pub fn get_max_x2apic_id(topology: (u16, u16, u16, u16)) -> u32 {
     )
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum CpuidReg {
     EAX,
     EBX,
