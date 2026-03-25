@@ -48,10 +48,11 @@ use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmConfig, VmCounters, VmDelete, VmDiskMirrorCancel, VmDiskMirrorComplete, VmDiskMirrorStart,
-    VmDiskMirrorStatus, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmReceiveMigrationData, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore,
-    VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+    VmCancelMigration, VmConfig, VmCounters, VmDelete, VmDiskMirrorCancel, VmDiskMirrorComplete,
+    VmDiskMirrorStart, VmDiskMirrorStatus, VmMigrationProgress, VmNmi, VmPause,
+    VmPostMigrationAnnounce, VmPowerButton, VmReboot, VmReceiveMigration, VmReceiveMigrationData,
+    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
+    VmShutdown, VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -422,6 +423,7 @@ vm_action_put_handler!(VmShutdown);
 vm_action_put_handler!(VmReboot);
 vm_action_put_handler!(VmPause);
 vm_action_put_handler!(VmResume);
+vm_action_put_handler!(VmPostMigrationAnnounce);
 vm_action_put_handler!(VmPowerButton);
 vm_action_put_handler!(VmNmi);
 
@@ -437,34 +439,6 @@ vm_action_put_handler_body!(VmRemoveDevice);
 vm_action_put_handler_body!(VmResizeDisk);
 vm_action_put_handler_body!(VmResizeZone);
 vm_action_put_handler_body!(VmSnapshot);
-// Special handling for externally provided FDs.
-// See module description for more info.
-impl PutHandler for VmReceiveMigration {
-    fn handle_request(
-        &'static self,
-        api_notifier: EventFd,
-        api_sender: Sender<ApiRequest>,
-        body: &Option<Body>,
-        files: Vec<File>,
-    ) -> std::result::Result<Option<Body>, HttpError> {
-        if let Some(body) = body {
-            let mut net_cfg: VmReceiveMigrationData = serde_json::from_slice(body.raw())?;
-            if !net_cfg.net_fds.is_empty() {
-                let mut cfgs = net_cfg.net_fds.iter_mut().collect::<Vec<&mut _>>();
-                let cfgs = cfgs.as_mut_slice();
-                attach_fds_to_cfgs(files, cfgs)?;
-            }
-
-            self.send(api_notifier, api_sender, net_cfg)
-                .map_err(HttpError::ApiError)
-        } else {
-            Err(HttpError::BadRequest)
-        }
-    }
-}
-
-impl GetHandler for VmReceiveMigration {}
-
 vm_action_put_handler_body!(VmSendMigration);
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -493,6 +467,34 @@ impl PutHandler for VmAddNet {
 }
 
 impl GetHandler for VmAddNet {}
+
+// Special handling for externally provided FDs.
+// See module description for more info.
+impl PutHandler for VmReceiveMigration {
+    fn handle_request(
+        &'static self,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+        body: &Option<Body>,
+        files: Vec<File>,
+    ) -> std::result::Result<Option<Body>, HttpError> {
+        if let Some(body) = body {
+            let mut net_cfg: VmReceiveMigrationData = serde_json::from_slice(body.raw())?;
+            if !net_cfg.net_fds.is_empty() {
+                let mut cfgs = net_cfg.net_fds.iter_mut().collect::<Vec<&mut _>>();
+                let cfgs = cfgs.as_mut_slice();
+                attach_fds_to_cfgs(files, cfgs)?;
+            }
+
+            self.send(api_notifier, api_sender, net_cfg)
+                .map_err(HttpError::ApiError)
+        } else {
+            Err(HttpError::BadRequest)
+        }
+    }
+}
+
+impl GetHandler for VmReceiveMigration {}
 
 vm_action_put_handler_body!(VmDiskMirrorStart, |error| {
     if let ApiError::VmDiskMirrorStart(VmError::DeviceManager(device_error)) = &error {

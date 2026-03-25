@@ -2218,6 +2218,21 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_post_migration_announce(&mut self) -> result::Result<(), VmError> {
+        match self.vm {
+            VmOwnership::Owned(ref vm) => {
+                if vm.get_state() != VmState::Running {
+                    return Err(VmError::VmNotRunning);
+                }
+
+                vm.post_migration_announce();
+                Ok(())
+            }
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
