@@ -130,8 +130,6 @@ use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
 #[cfg(target_arch = "x86_64")]
 use vmm_sys_util::{fam::FamStruct, ioctl_io_nr};
-#[cfg(feature = "tdx")]
-use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_iowr_nr};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::RegList;

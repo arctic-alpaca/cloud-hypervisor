@@ -14,9 +14,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 #[cfg(target_arch = "x86_64")]
-use crate::arch::x86::{
-    AmxGuestSupportError, CpuIdEntry, MsrEntry, amx_supported, request_guest_amx_support,
-};
+use crate::arch::x86::{CpuIdEntry, MsrEntry, amx_supported, request_guest_amx_support};
 #[cfg(target_arch = "x86_64")]
 use crate::cpu::CpuVendor;
 #[cfg(feature = "tdx")]
