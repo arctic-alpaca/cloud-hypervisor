@@ -16,6 +16,7 @@ pub mod regs;
 #[cfg(feature = "tdx")]
 pub mod tdx;
 
+mod helpers;
 mod mpspec;
 mod mptable;
 mod smbios;
@@ -23,6 +24,7 @@ mod smbios;
 use std::arch::x86_64;
 use std::mem;
 
+use helpers::{deserialize_u32_hex, serialize_u32_hex};
 use hypervisor::arch::x86::{CPUID_FLAG_VALID_INDEX, CpuIdEntry};
 use hypervisor::{CpuVendor, HypervisorCpuError, HypervisorError};
 use linux_loader::loader::bootparam::{boot_params, setup_header};
@@ -56,6 +58,9 @@ const AMX_INT8: u8 = 25; // AMX tile computation on 8-bit integers
 
 const AMX_FP16: u8 = 21; // AMX tile computation on fp16 numbers
 const AMX_COMPLEX: u8 = 8; // AMX tile computation on complex numbers
+
+const AMX_TILECFG_BIT: u8 = 17; // AMX tile cfg state component bit
+const AMX_TILEDATA_BIT: u8 = 18; // AMX tile data state component bit
 
 // KVM feature bits
 #[cfg(feature = "tdx")]
