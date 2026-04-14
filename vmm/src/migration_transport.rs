@@ -7,7 +7,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::result::Result;
@@ -151,16 +151,6 @@ impl Write for SocketStream {
             SocketStream::Unix(stream) => stream.flush(),
             SocketStream::Tcp(stream) => stream.flush(),
             SocketStream::Tls(stream) => stream.flush(),
-        }
-    }
-}
-
-impl AsRawFd for SocketStream {
-    fn as_raw_fd(&self) -> RawFd {
-        match self {
-            SocketStream::Unix(s) => s.as_raw_fd(),
-            SocketStream::Tcp(s) => s.as_raw_fd(),
-            SocketStream::Tls(s) => s.as_fd().as_raw_fd(),
         }
     }
 }
