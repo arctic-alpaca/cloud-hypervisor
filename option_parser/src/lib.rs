@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+pub mod fd;
+
 use std::collections::HashMap;
 use std::fmt::{Display, Write};
 use std::num::ParseIntError;
