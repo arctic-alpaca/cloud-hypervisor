@@ -113,47 +113,47 @@ mod fds_helper {
         fn expected_num_fds(&self) -> usize;
     }
 
-    mod config_with_fds_impls {
-        use std::os::fd::RawFd;
-
-        use super::{ConfigWithFDs, ConfigWithVariableFDs};
-        use crate::config::RestoredNetConfig;
-        use crate::vm_config::NetConfig;
-
-        impl ConfigWithFDs for NetConfig {
-            fn id(&self) -> Option<&str> {
-                self.id.as_deref()
-            }
-
-            fn fds_from_http_body(&self) -> Option<&[RawFd]> {
-                self.fds.as_deref()
-            }
-
-            fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
-                self.fds = fds;
-            }
-        }
-
-        impl ConfigWithFDs for RestoredNetConfig {
-            fn id(&self) -> Option<&str> {
-                Some(self.id.as_str())
-            }
-
-            fn fds_from_http_body(&self) -> Option<&[RawFd]> {
-                self.fds.as_deref()
-            }
-
-            fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
-                self.fds = fds;
-            }
-        }
-
-        impl ConfigWithVariableFDs for RestoredNetConfig {
-            fn expected_num_fds(&self) -> usize {
-                self.num_fds
-            }
-        }
-    }
+    // mod config_with_fds_impls {
+    //     use std::os::fd::RawFd;
+    //
+    //     use super::{ConfigWithFDs, ConfigWithVariableFDs};
+    //     use crate::config::RestoredNetConfig;
+    //     use crate::vm_config::NetConfig;
+    //
+    //     impl ConfigWithFDs for NetConfig {
+    //         fn id(&self) -> Option<&str> {
+    //             self.id.as_deref()
+    //         }
+    //
+    //         fn fds_from_http_body(&self) -> Option<&[RawFd]> {
+    //             self.fds.as_deref()
+    //         }
+    //
+    //         fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
+    //             self.fds = fds;
+    //         }
+    //     }
+    //
+    //     impl ConfigWithFDs for RestoredNetConfig {
+    //         fn id(&self) -> Option<&str> {
+    //             Some(self.id.as_str())
+    //         }
+    //
+    //         fn fds_from_http_body(&self) -> Option<&[RawFd]> {
+    //             self.fds.as_deref()
+    //         }
+    //
+    //         fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
+    //             self.fds = fds;
+    //         }
+    //     }
+    //
+    //     impl ConfigWithVariableFDs for RestoredNetConfig {
+    //         fn expected_num_fds(&self) -> usize {
+    //             self.num_fds
+    //         }
+    //     }
+    // }
 
     fn attach_fds_to_cfg_inner<T: ConfigWithFDs>(
         fds: &mut Vec<RawFd>,
@@ -500,10 +500,10 @@ impl PutHandler for VmRestore {
         if let Some(body) = body {
             let mut restore_cfg: RestoreConfig = serde_json::from_slice(body.raw())?;
 
-            if let Some(cfgs) = restore_cfg.net_fds.as_mut() {
-                let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
-                let cfgs = cfgs.as_mut_slice();
-                attach_fds_to_cfgs(files, cfgs)?;
+            if let Some(net_fds) = restore_cfg.net_fds.as_mut() {
+                //TODO add some checks
+                //TODO: verify the order is stable
+                net_fds.ingest_fds(files);
             }
 
             self.send(api_notifier, api_sender, restore_cfg)

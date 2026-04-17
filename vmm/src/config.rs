@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(feature = "ivshmem")]
 use std::fs;
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
 
+use crate::fd::{FdFilter, FdMap};
 use crate::landlock::LandlockAccess;
 use crate::vm_config::*;
 
@@ -2628,38 +2630,6 @@ impl NumaConfig {
 //     }
 // }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct RestoredNetConfig {
-    device: Vec<FdDevice>,
-    // Special deserialize handling:
-    // A serialize-deserialize cycle typically happens across processes.
-    // Therefore, we don't serialize FDs, and whatever value is here after
-    // deserialization is invalid.
-    //
-    // Valid FDs are transmitted via a different channel (SCM_RIGHTS message)
-    // and will be populated into this struct on the destination VMM eventually.
-    #[serde(default, deserialize_with = "deserialize_restorednetconfig_fds")]
-    pub fds: Vec<i32>,
-}
-
-fn deserialize_restorednetconfig_fds<'de, D>(d: D) -> std::result::Result<Vec<i32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fds: Option<Vec<i32>> = Option::deserialize(d)?;
-    if let Some(invalid_fds) = invalid_fds {
-        // If the live-migration path is used properly, new FDs are passed as
-        // SCM_RIGHTS message. So, we don't get them from the serialized JSON
-        // anyway.
-        debug!(
-            "FDs in 'RestoredNetConfig' won't be deserialized as they are most likely invalid now. Deserializing them as -1."
-        );
-        Ok(vec![-1; invalid_fds.len()])
-    } else {
-        Ok(vec![])
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum MemoryRestoreMode {
     /// Restore by eagerly copying the snapshot into guest RAM before resume.
@@ -2695,7 +2665,7 @@ pub struct RestoreConfig {
     #[serde(default)]
     pub memory_restore_mode: MemoryRestoreMode,
     #[serde(default)]
-    pub net_fds: Option<Vec<RestoredNetConfig>>,
+    pub net_fds: Option<FdMap>,
     #[serde(default)]
     pub resume: bool,
 }
@@ -2721,6 +2691,8 @@ impl RestoreConfig {
             .add("resume");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
+        let mut net_fds = FdMap::new();
+
         let source_url = parser
             .get("source_url")
             .map(PathBuf::from)
@@ -2734,18 +2706,25 @@ impl RestoreConfig {
             .convert::<MemoryRestoreMode>("memory_restore_mode")
             .map_err(Error::ParseRestore)?
             .unwrap_or_default();
-        let net_fds = parser
-            .convert::<Tuple<String, Vec<u64>>>("net_fds")
+        parser
+            .convert::<Tuple<FdDevice, Vec<u64>>>("net_fds")
             .map_err(Error::ParseRestore)?
             .map(|v| {
-                v.0.iter()
-                    .map(|(id, fds)| RestoredNetConfig {
-                        id: id.clone(),
-                        num_fds: fds.len(),
-                        fds: Some(fds.iter().map(|e| *e as i32).collect()),
-                    })
-                    .collect()
+                v.0.iter().for_each(|(fd_device, fds)| {
+                    fds.iter().for_each(|fd| {
+                        if !net_fds.insert(fd_device.clone(), *fd as i32, FdFilter::Net) {
+                            panic!("Invalid FdDevice in net_fds: {:?}", fd_device);
+                        }
+                    });
+                });
             });
+
+        let net_fds = if net_fds.is_empty() {
+            None
+        } else {
+            Some(net_fds)
+        };
+
         let resume = parser
             .convert::<Toggle>("resume")
             .map_err(Error::ParseRestore)?
@@ -2767,44 +2746,6 @@ impl RestoreConfig {
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
-        }
-
-        let mut restored_net_with_fds = HashMap::new();
-        for n in self.net_fds.iter().flatten() {
-            assert_eq!(
-                n.num_fds,
-                n.fds.as_ref().map_or(0, |f| f.len()),
-                "Invalid 'RestoredNetConfig' with conflicted fields."
-            );
-            if restored_net_with_fds.insert(n.id.clone(), n).is_some() {
-                return Err(ValidationError::IdentifierNotUnique(n.id.clone()));
-            }
-        }
-
-        for net_fds in vm_config.net.iter().flatten() {
-            if let Some(expected_fds) = &net_fds.fds {
-                let expected_id = net_fds
-                    .id
-                    .as_ref()
-                    .expect("Invalid 'NetConfig' with empty 'id' for VM restore.");
-                if let Some(r) = restored_net_with_fds.remove(expected_id) {
-                    if r.num_fds != expected_fds.len() {
-                        return Err(ValidationError::RestoreNetFdCountMismatch(
-                            expected_id.clone(),
-                            r.num_fds,
-                            expected_fds.len(),
-                        ));
-                    }
-                } else {
-                    return Err(ValidationError::RestoreMissingRequiredNetId(
-                        expected_id.clone(),
-                    ));
-                }
-            }
-        }
-
-        if !restored_net_with_fds.is_empty() {
-            warn!("Ignoring unused 'net_fds' for VM restore.");
         }
 
         Ok(())

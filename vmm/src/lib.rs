@@ -79,6 +79,7 @@ mod coredump;
 pub mod cpu;
 pub mod device_manager;
 pub mod device_tree;
+mod fd;
 #[cfg(feature = "guest_debug")]
 mod gdb;
 #[cfg(feature = "igvm")]
@@ -1775,20 +1776,11 @@ impl RequestHandler for Vmm {
         restore_cfg
             .validate(&vm_config.lock().unwrap().clone())
             .map_err(VmError::ConfigValidation)?;
-
         // Update VM's net configurations with new fds received for restore operation
-        if let (Some(restored_nets), Some(vm_net_configs)) =
-            (restore_cfg.net_fds, &mut vm_config.lock().unwrap().net)
-        {
-            for net in restored_nets.iter() {
-                for net_config in vm_net_configs.iter_mut() {
-                    // update only if the net dev is backed by FDs
-                    if net_config.id.as_ref() == Some(&net.id) && net_config.fds.is_some() {
-                        net_config.fds.clone_from(&net.fds);
-                    }
-                }
-            }
-        }
+        if let Some(net_fds) = restore_cfg.net_fds {
+            //TODO: handle errors
+            net_fds.apply(&mut vm_config.lock().unwrap()).unwrap();
+        };
 
         self.vm_restore(
             source_url,

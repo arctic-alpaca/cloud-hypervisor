@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -9,9 +11,9 @@ pub enum FdDeviceParseError {
     InvalidValue(String),
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Ord, PartialOrd)]
 pub enum FdDevice {
-    Net { id: usize },
+    Net { id: String },
 }
 
 impl Parseable for FdDevice {
@@ -24,12 +26,9 @@ impl Parseable for FdDevice {
         let inner_value = &parts.1[0..parts.1.len() - 1];
         let expected_closing_bracket = &parts.1[parts.1.len() - 1..];
         let result = match parts.0 {
-            "net" => {
-                let id = inner_value
-                    .parse()
-                    .map_err(|_| FdDeviceParseError::InvalidValue(inner_value.to_owned()))?;
-                Ok(FdDevice::Net { id })
-            }
+            "net" => Ok(FdDevice::Net {
+                id: inner_value.to_owned(),
+            }),
             unknown => Err(FdDeviceParseError::InvalidValue(unknown.to_owned())),
         }?;
         if expected_closing_bracket != ")" {
@@ -46,8 +45,12 @@ mod unit_tests {
     #[test]
     fn test_parse_valid_net_device() {
         let input = "net(123)";
-        let expected = FdDevice::Net { id: 123 };
-        assert_eq!(FdDevice::from_str(input), Ok(expected));
+        assert_eq!(
+            FdDevice::from_str(input),
+            Ok(FdDevice::Net {
+                id: "123".to_owned()
+            })
+        );
 
         let input = "net(-123)";
         assert_eq!(
