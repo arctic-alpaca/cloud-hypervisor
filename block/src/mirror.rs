@@ -14,7 +14,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::{io, mem};
 
 use libc::{iovec, off_t};
+use vmm_sys_util::poll::PollContext;
 
+use crate::async_io::AsyncIo;
 
 /// Serializes overlapping byte ranges between the copy worker and the
 /// per-queue mirror writes.
@@ -196,6 +198,45 @@ impl MirrorState {
         }
 
         *current = target;
+    }
+}
+
+/// Owns an [`AsyncIo`] backend and waits for its completions.
+///
+/// Waiting uses a poller because the backend's notifier is created
+/// non-blocking and therefore never blocks on read.
+struct CompletionIo {
+    poll: PollContext<()>,
+    io: Box<dyn AsyncIo>,
+}
+
+#[expect(dead_code)]
+impl CompletionIo {
+    fn new(io: Box<dyn AsyncIo>) -> io::Result<Self> {
+        let poll = PollContext::new()?;
+        poll.add(io.notifier(), ())?;
+        Ok(Self { poll, io })
+    }
+
+    fn io(&self) -> &dyn AsyncIo {
+        self.io.as_ref()
+    }
+
+    fn io_mut(&mut self) -> &mut dyn AsyncIo {
+        self.io.as_mut()
+    }
+
+    /// Blocks until the owned backend reports a completion, then returns it.
+    fn next_completion(&mut self) -> io::Result<(u64, i32)> {
+        loop {
+            if let Some(completion) = self.io.next_completed_request() {
+                return Ok(completion);
+            }
+            // EINTR is retried inside `wait`.
+            self.poll.wait()?;
+            // Drain the eventfd so the next wait does not fire on a stale signal.
+            self.io.notifier().read()?;
+        }
     }
 }
 
