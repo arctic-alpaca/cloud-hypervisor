@@ -30,7 +30,10 @@ impl Parseable for FdDevice {
         let expected_closing_bracket = &parts.1[parts.1.len() - 1..];
         let result = match parts.0 {
             "net" => Ok(FdDevice::Net {
-                id: inner_value.to_owned(),
+                id: inner_value
+                    .parse::<usize>()
+                    .map_err(|_| FdDeviceParseError::InvalidValue(inner_value.to_owned()))?
+                    .to_string(),
             }),
             unknown => Err(FdDeviceParseError::InvalidValue(unknown.to_owned())),
         }?;

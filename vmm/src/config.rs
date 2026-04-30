@@ -4167,8 +4167,8 @@ mod unit_tests {
             NetConfig {
                 host_mac: None,
                 fds: Some(vec![
-                    SerializableFd::new_invalid(3),
-                    SerializableFd::new_invalid(7)
+                    SerializableFd::new_valid(3),
+                    SerializableFd::new_valid(7)
                 ]),
                 num_queues: 4,
                 ..net_fixture()
