@@ -33,8 +33,10 @@ use arch::layout::{APIC_START, IOAPIC_SIZE, IOAPIC_START};
 use arch::{DeviceType, MmioDeviceInfo};
 use arch::{NumaNodes, layout};
 use block::ImageType;
+use block::disk_file::AsyncFullDiskFile;
 use block::error::BlockError;
 use block::factory::{DiskOpenOptions, open_disk};
+use block::mirror::MirrorStatus;
 #[cfg(target_arch = "riscv64")]
 use devices::aia;
 #[cfg(target_arch = "x86_64")]
@@ -85,6 +87,7 @@ use tracer::trace_scoped;
 #[cfg(feature = "kvm")]
 use vfio_ioctls::VfioIommufd;
 use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd, VfioOps};
+use virtio_devices::block::MirrorError;
 use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator, VirtioTransport};
 use virtio_devices::vhost_user::VhostUserConfig;
 use virtio_devices::{
@@ -690,6 +693,13 @@ pub enum DeviceManagerError {
     #[error("No BDF assigned to boot entry")]
     BdfForBootDeviceMissing,
 
+    /// Reports a failure to start block mirroring.
+    #[error("Failed to start block mirroring")]
+    BlockMirrorStart(#[source] MirrorError),
+
+    /// Block mirroring is not active for the current device.
+    #[error("Block mirroring is not active for the current disk with identifier: {0}")]
+    BlockMirrorNotActive(String),
 }
 
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
@@ -5349,6 +5359,88 @@ impl DeviceManager {
             self.vfio_ops = None;
         }
     }
+
+    /// Returns a copy of the config of the disk with the given device id.
+    fn find_disk_config(&self, device_id: &str) -> DeviceManagerResult<DiskConfig> {
+        self.config
+            .lock()
+            .unwrap()
+            .disks
+            .iter()
+            .flatten()
+            .find(|disk_config| disk_config.pci_common.id.as_deref() == Some(device_id))
+            .cloned()
+            .ok_or_else(|| DeviceManagerError::UnknownDeviceId(device_id.to_string()))
+    }
+
+    /// Opens a disk image with `config`'s options and validates its type.
+    fn open_disk_with_config(
+        config: &DiskConfig,
+        path: &Path,
+        readonly: bool,
+    ) -> DeviceManagerResult<Box<dyn AsyncFullDiskFile>> {
+        let options = DiskOpenOptions {
+            path,
+            readonly,
+            direct: config.direct,
+            sparse: config.sparse,
+            backing_files: config.backing_files,
+            disable_io_uring: config.disable_io_uring,
+            disable_aio: config.disable_aio,
+        };
+
+        let opened = open_disk(&options).map_err(DeviceManagerError::Disk)?;
+        if opened.image_type != config.image_type {
+            return Err(DeviceManagerError::DiskImageTypeMismatch {
+                specified: config.image_type,
+                detected: opened.image_type,
+            });
+        }
+        Ok(opened.disk)
+    }
+
+    /// Starts mirroring the disk identified by `device_id` to `dest_path`.
+    ///
+    /// The destination file must already exist and use the same image
+    /// format as the source disk. It is handed to the virtio block device,
+    /// which mirrors later guest writes out to both backends while a
+    /// background worker copies the existing source contents.
+    ///
+    /// Returns an error if no disk with the given identifier is attached
+    /// to the VM, or the destination cannot be opened.
+    pub fn mirror_disk(&self, device_id: &str, dest_path: &Path) -> DeviceManagerResult<()> {
+        let mut disk = self
+            .block_devices
+            .iter()
+            .map(|dev| dev.lock().unwrap())
+            .find(|disk| disk.id() == device_id)
+            .ok_or_else(|| DeviceManagerError::UnknownDeviceId(device_id.to_string()))?;
+
+        let src = self.find_disk_config(device_id)?;
+
+        let destination = Self::open_disk_with_config(&src, dest_path, false)?;
+
+        disk.start_mirror(destination, dest_path.to_path_buf())
+            .map_err(DeviceManagerError::BlockMirrorStart)?;
+
+        Ok(())
+    }
+
+    /// Returns the current state of the active mirror for the disk
+    /// identified by `device_id`.
+    ///
+    /// Returns an error if no disk with the given identifier is
+    /// attached to the VM, or if the disk has no active mirror.
+    pub fn mirror_disk_status(&self, device_id: &str) -> DeviceManagerResult<MirrorStatus> {
+        self.block_devices
+            .iter()
+            .map(|dev| dev.lock().unwrap())
+            .find(|disk| disk.id() == device_id)
+            .ok_or_else(|| DeviceManagerError::UnknownDeviceId(device_id.to_string()))?
+            .mirror_status()
+            .ok_or_else(|| DeviceManagerError::BlockMirrorNotActive(device_id.to_string()))
+    }
+
     /// Returns a list of devices for which a boot index was configured.
     #[cfg(all(target_arch = "x86_64", feature = "fw_cfg"))]
     pub fn boot_order_entries(&self) -> Vec<BootOrderEntry> {
