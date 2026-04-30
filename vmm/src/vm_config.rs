@@ -10,13 +10,14 @@ use std::{fs, result};
 
 use block::ImageType;
 pub use block::fcntl::LockGranularityChoice;
-use log::{debug, warn};
+use log::warn;
 use net_util::MacAddr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
 
 use crate::Landlock;
+use crate::fd::SerializableFd;
 use crate::landlock::LandlockError;
 
 pub type LandlockResult<T> = result::Result<T, LandlockError>;
@@ -367,14 +368,8 @@ pub struct NetConfig {
     pub vhost_mode: VhostMode,
     #[serde(default)]
     pub id: Option<String>,
-    // Special deserialize handling:
-    // Therefore, we don't serialize FDs, and whatever value is here after
-    // deserialization is invalid.
-    //
-    // Valid FDs are transmitted via a different channel (SCM_RIGHTS message)
-    // and will be populated into this struct on the destination VMM eventually.
-    #[serde(default, deserialize_with = "deserialize_netconfig_fds")]
-    pub fds: Option<Vec<i32>>,
+    #[serde(default)]
+    pub fds: Option<Vec<SerializableFd>>,
     #[serde(default)]
     pub rate_limiter_config: Option<RateLimiterConfig>,
     #[serde(default)]
@@ -409,21 +404,6 @@ pub const DEFAULT_NET_QUEUE_SIZE: u16 = 256;
 
 pub fn default_netconfig_queue_size() -> u16 {
     DEFAULT_NET_QUEUE_SIZE
-}
-
-fn deserialize_netconfig_fds<'de, D>(d: D) -> Result<Option<Vec<i32>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fds: Option<Vec<i32>> = Option::deserialize(d)?;
-    if let Some(invalid_fds) = invalid_fds {
-        debug!(
-            "FDs in 'NetConfig' won't be deserialized as they are most likely invalid now. Deserializing them as -1."
-        );
-        Ok(Some(vec![-1; invalid_fds.len()]))
-    } else {
-        Ok(None)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

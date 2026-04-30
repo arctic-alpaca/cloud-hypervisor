@@ -1780,7 +1780,7 @@ impl RequestHandler for Vmm {
         if let Some(net_fds) = restore_cfg.net_fds {
             //TODO: handle errors
             net_fds.apply(&mut vm_config.lock().unwrap()).unwrap();
-        };
+        }
 
         self.vm_restore(
             source_url,

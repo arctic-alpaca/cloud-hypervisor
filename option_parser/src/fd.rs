@@ -1,9 +1,12 @@
-use std::collections::BTreeMap;
+use std::fs::File;
+use std::ops::Deref;
+use std::os::fd::{AsRawFd, RawFd};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::private_trait::Parseable;
+use crate::{IntegerList, TupleError, TupleValue};
 
 #[derive(Error, Debug, Eq, PartialEq)]
 pub enum FdDeviceParseError {
@@ -35,6 +38,120 @@ impl Parseable for FdDevice {
             return Err(FdDeviceParseError::InvalidValue(s.to_owned()));
         }
         Ok(result)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SerializableFdInner {
+    Valid(RawFd),
+    Invalid(RawFd),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerializableFd {
+    #[serde(
+        serialize_with = "serialize_serializable_fd_inner",
+        deserialize_with = "deserialize_serializable_fd_inner"
+    )]
+    inner: SerializableFdInner,
+}
+
+impl SerializableFd {
+    pub fn new_valid(fd: RawFd) -> Self {
+        Self {
+            inner: SerializableFdInner::Valid(fd),
+        }
+    }
+    pub fn new_invalid(fd: RawFd) -> Self {
+        Self {
+            inner: SerializableFdInner::Invalid(fd),
+        }
+    }
+
+    pub fn update_fds(serializable_fds: &mut [Self], valid_fds: Vec<File>) {
+        // TODO: proper error handling
+        assert_eq!(serializable_fds.len(), valid_fds.len());
+        serializable_fds
+            .iter_mut()
+            .zip(valid_fds)
+            .for_each(|(serializable_fd, fd)| serializable_fd.update_fd(fd.as_raw_fd()));
+    }
+}
+
+impl Deref for SerializableFd {
+    type Target = RawFd;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.inner {
+            SerializableFdInner::Valid(fd) => fd,
+            SerializableFdInner::Invalid(_) => {
+                panic!("cannot access invalid FD");
+            }
+        }
+    }
+}
+
+impl SerializableFd {
+    pub fn update_fd(&mut self, fd: RawFd) {
+        if let SerializableFdInner::Valid(_) = self.inner {}
+        match self.inner {
+            SerializableFdInner::Valid(_) => {
+                // TODO: proper error handling
+                panic!("Cannot update valid FD");
+            }
+            SerializableFdInner::Invalid(_) => {
+                self.inner = SerializableFdInner::Valid(fd);
+            }
+        }
+    }
+}
+
+fn deserialize_serializable_fd_inner<'de, D>(d: D) -> Result<SerializableFdInner, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let fd: SerializableFdInner = SerializableFdInner::deserialize(d)?;
+    match fd {
+        SerializableFdInner::Valid(fd) => Ok(SerializableFdInner::Invalid(fd)),
+        SerializableFdInner::Invalid(fd) => Ok(SerializableFdInner::Invalid(fd)),
+    }
+}
+
+fn serialize_serializable_fd_inner<S>(
+    serializable_fd_inner: &SerializableFdInner,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let fd = match serializable_fd_inner {
+        SerializableFdInner::Valid(fd) => SerializableFdInner::Invalid(*fd),
+        SerializableFdInner::Invalid(fd) => SerializableFdInner::Invalid(*fd),
+    };
+    fd.serialize(serializer)
+}
+
+// impl Parseable for SerializableFd {
+//     type Err = ();
+//
+//     fn from_str(input: &str) -> Result<Self, <Self as Parseable>::Err> {
+//         //TODO: error handling
+//         let fd = <i32 as Parseable>::from_str(input).unwrap();
+//         Ok(Self::new_valid(fd))
+//     }
+// }
+
+impl TupleValue for Vec<SerializableFd> {
+    fn parse_value(input: &str) -> Result<Self, TupleError>
+    where
+        Self: Sized,
+    {
+        Ok(IntegerList::from_str(input)
+            .map_err(TupleError::InvalidIntegerList)?
+            .0
+            .iter()
+            .map(|v| SerializableFd::new_valid(*v as RawFd))
+            .collect())
     }
 }
 

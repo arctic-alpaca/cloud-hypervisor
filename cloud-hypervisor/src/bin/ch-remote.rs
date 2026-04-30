@@ -883,13 +883,18 @@ fn add_pmem_config(config: &str) -> Result<String, Error> {
 }
 
 fn add_net_config(config: &str) -> Result<(String, Vec<i32>), Error> {
-    let mut net_config = NetConfig::parse(config).map_err(Error::AddNetConfig)?;
+    let net_config = NetConfig::parse(config).map_err(Error::AddNetConfig)?;
 
-    // NetConfig is modified on purpose here by taking the list of file
-    // descriptors out. Keeping the list and send it to the server side
-    // process would not make any sense since the file descriptor may be
-    // represented with different values.
-    let fds = net_config.fds.take().unwrap_or_default();
+    let fds = net_config
+        .fds
+        .clone()
+        .map(|serializable_fds| {
+            serializable_fds
+                .iter()
+                .map(|serializable_fd| **serializable_fd)
+                .collect()
+        })
+        .unwrap_or_default();
     let net_config = serde_json::to_string(&net_config).unwrap();
 
     Ok((net_config, fds))
@@ -922,10 +927,7 @@ fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
     // RestoreConfig is modified on purpose to take out the file descriptors.
     // These fds are passed to the server side process via SCM_RIGHTS
     let fds = match &mut restore_config.net_fds {
-        Some(net_fds) => net_fds
-            .iter_mut()
-            .flat_map(|net| net.fds.take().unwrap_or_default())
-            .collect(),
+        Some(net_fds) => net_fds.extract_fds_for_scm_rights(),
         None => Vec::new(),
     };
     let restore_config = serde_json::to_string(&restore_config).unwrap();

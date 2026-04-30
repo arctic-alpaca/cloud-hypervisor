@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "ivshmem")]
 use std::fs;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::result;
 use std::str::FromStr;
@@ -14,8 +14,8 @@ use std::sync::LazyLock;
 
 use block::ImageType;
 use clap::ArgMatches;
-use log::{debug, warn};
-use option_parser::fd::FdDevice;
+use log::warn;
+use option_parser::fd::{FdDevice, SerializableFd};
 use option_parser::{
     ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple,
 };
@@ -1557,7 +1557,11 @@ impl NetConfig {
         let fds = parser
             .convert::<IntegerList>("fd")
             .map_err(Error::ParseNetwork)?
-            .map(|v| v.0.iter().map(|e| *e as i32).collect());
+            .map(|v| {
+                v.0.iter()
+                    .map(|e| SerializableFd::new_valid(*e as RawFd))
+                    .collect()
+            });
         let pci_segment = parser
             .convert("pci_segment")
             .map_err(Error::ParseNetwork)?
@@ -1651,9 +1655,9 @@ impl NetConfig {
                 ));
             }
 
-            for &fd in fds {
-                if fd <= 2 {
-                    return Err(ValidationError::VnetReservedFd(fd));
+            for fd in fds {
+                if **fd <= 2 {
+                    return Err(ValidationError::VnetReservedFd(**fd));
                 }
             }
         }
@@ -2706,18 +2710,18 @@ impl RestoreConfig {
             .convert::<MemoryRestoreMode>("memory_restore_mode")
             .map_err(Error::ParseRestore)?
             .unwrap_or_default();
-        parser
-            .convert::<Tuple<FdDevice, Vec<u64>>>("net_fds")
+        if let Some(v) = parser
+            .convert::<Tuple<FdDevice, Vec<SerializableFd>>>("net_fds")
             .map_err(Error::ParseRestore)?
-            .map(|v| {
-                v.0.iter().for_each(|(fd_device, fds)| {
-                    fds.iter().for_each(|fd| {
-                        if !net_fds.insert(fd_device.clone(), *fd as i32, FdFilter::Net) {
-                            panic!("Invalid FdDevice in net_fds: {:?}", fd_device);
-                        }
-                    });
+        {
+            v.0.into_iter().for_each(|(fd_device, fds)| {
+                fds.into_iter().for_each(|fd| {
+                    if !net_fds.insert(fd_device.clone(), fd, FdFilter::Net) {
+                        panic!("Invalid FdDevice in net_fds: {fd_device:?}");
+                    }
                 });
             });
+        }
 
         let net_fds = if net_fds.is_empty() {
             None
@@ -2743,7 +2747,7 @@ impl RestoreConfig {
     // Ensure all net devices from 'VmConfig' backed by FDs have a
     // corresponding 'RestoreNetConfig' with a matched 'id' and expected
     // number of FDs.
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, _vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
         }
@@ -4162,7 +4166,10 @@ mod unit_tests {
             NetConfig::parse("mac=de:ad:be:ef:12:34,fd=[3,7],num_queues=4")?,
             NetConfig {
                 host_mac: None,
-                fds: Some(vec![3, 7]),
+                fds: Some(vec![
+                    SerializableFd::new_invalid(3),
+                    SerializableFd::new_invalid(7)
+                ]),
                 num_queues: 4,
                 ..net_fixture()
             }
@@ -4682,18 +4689,20 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: Some(vec![
-                    RestoredNetConfig {
-                        id: "net0".to_string(),
-                        num_fds: 2,
-                        fds: Some(vec![3, 4]),
-                    },
-                    RestoredNetConfig {
-                        id: "net1".to_string(),
-                        num_fds: 4,
-                        fds: Some(vec![5, 6, 7, 8]),
-                    }
-                ]),
+                net_fds: Some(FdMap::new_with_content(&[
+                    (
+                        FdDevice::Net {
+                            id: "net0".to_string()
+                        },
+                        vec![3, 4]
+                    ),
+                    (
+                        FdDevice::Net {
+                            id: "net1".to_string()
+                        },
+                        vec![5, 6, 7, 8]
+                    )
+                ])),
                 resume: false,
             }
         );
@@ -4779,13 +4788,21 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 NetConfig {
                     id: Some("net0".to_owned()),
                     num_queues: 2,
-                    fds: Some(vec![-1, -1, -1, -1]),
+                    fds: Some(vec![
+                        SerializableFd::new_invalid(-1),
+                        SerializableFd::new_invalid(-1),
+                        SerializableFd::new_invalid(-1),
+                        SerializableFd::new_invalid(-1),
+                    ]),
                     ..net_fixture()
                 },
                 NetConfig {
                     id: Some("net1".to_owned()),
                     num_queues: 1,
-                    fds: Some(vec![-1, -1]),
+                    fds: Some(vec![
+                        SerializableFd::new_invalid(-1),
+                        SerializableFd::new_invalid(-1),
+                    ]),
                     ..net_fixture()
                 },
                 NetConfig {
@@ -4804,28 +4821,31 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
-            net_fds: Some(vec![
-                RestoredNetConfig {
-                    id: "net0".to_string(),
-                    num_fds: 4,
-                    fds: Some(vec![3, 4, 5, 6]),
-                },
-                RestoredNetConfig {
-                    id: "net1".to_string(),
-                    num_fds: 2,
-                    fds: Some(vec![7, 8]),
-                },
-            ]),
+            net_fds: Some(FdMap::new_with_content(&[
+                (
+                    FdDevice::Net {
+                        id: "net0".to_string(),
+                    },
+                    vec![3, 4, 5, 6],
+                ),
+                (
+                    FdDevice::Net {
+                        id: "net1".to_string(),
+                    },
+                    vec![7, 8],
+                ),
+            ])),
             resume: false,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "netx".to_string(),
-            num_fds: 4,
-            fds: Some(vec![3, 4, 5, 6]),
-        }]);
+        invalid_config.net_fds = Some(FdMap::new_with_content(&[(
+            FdDevice::Net {
+                id: "netx".to_string(),
+            },
+            vec![3, 4, 5, 6],
+        )]));
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
             Err(ValidationError::RestoreMissingRequiredNetId(
@@ -4833,28 +4853,31 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ))
         );
 
-        invalid_config.net_fds = Some(vec![
-            RestoredNetConfig {
-                id: "net0".to_string(),
-                num_fds: 4,
-                fds: Some(vec![3, 4, 5, 6]),
-            },
-            RestoredNetConfig {
-                id: "net0".to_string(),
-                num_fds: 4,
-                fds: Some(vec![3, 4, 5, 6]),
-            },
-        ]);
+        invalid_config.net_fds = Some(FdMap::new_with_content(&[
+            (
+                FdDevice::Net {
+                    id: "net0".to_string(),
+                },
+                vec![3, 4, 5, 6],
+            ),
+            (
+                FdDevice::Net {
+                    id: "net0".to_string(),
+                },
+                vec![3, 4, 5, 6],
+            ),
+        ]));
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
             Err(ValidationError::IdentifierNotUnique("net0".to_string()))
         );
 
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "net0".to_string(),
-            num_fds: 4,
-            fds: Some(vec![3, 4, 5, 6]),
-        }]);
+        invalid_config.net_fds = Some(FdMap::new_with_content(&[(
+            FdDevice::Net {
+                id: "net0".to_string(),
+            },
+            vec![3, 4, 5, 6],
+        )]));
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
             Err(ValidationError::RestoreMissingRequiredNetId(
@@ -4862,11 +4885,12 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ))
         );
 
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "net0".to_string(),
-            num_fds: 2,
-            fds: Some(vec![3, 4]),
-        }]);
+        invalid_config.net_fds = Some(FdMap::new_with_content(&[(
+            FdDevice::Net {
+                id: "net0".to_string(),
+            },
+            vec![3, 4],
+        )]));
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
             Err(ValidationError::RestoreNetFdCountMismatch(
@@ -5125,7 +5149,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut invalid_config = valid_config.clone();
         invalid_config.net = Some(vec![NetConfig {
-            fds: Some(vec![0]),
+            fds: Some(vec![SerializableFd::new_invalid(0)]),
             ..net_fixture()
         }]);
         assert_eq!(

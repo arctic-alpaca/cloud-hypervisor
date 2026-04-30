@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Seek, SeekFrom, stdout};
 use std::num::Wrapping;
+use std::os::fd::RawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(not(target_arch = "riscv64"))]
@@ -3004,9 +3005,10 @@ impl DeviceManager {
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
             } else if let Some(fds) = &net_cfg.fds {
+                let fds: Vec<RawFd> = fds.iter().map(|fd| **fd).collect();
                 let net = virtio_devices::Net::from_tap_fds(
                     id.clone(),
-                    fds,
+                    &fds,
                     Some(net_cfg.mac),
                     net_cfg.mtu,
                     self.force_iommu | net_cfg.iommu,
@@ -4733,10 +4735,10 @@ impl DeviceManager {
 
                     debug!("Closing preserved FDs from virtio-net device: id={id}, fds={fds:?}");
                     for fd in fds {
-                        config.preserved_fds.as_mut().unwrap().retain(|x| *x != fd);
+                        config.preserved_fds.as_mut().unwrap().retain(|x| *x != *fd);
                         // SAFETY: We are closing the only remaining instance of this FD.
                         unsafe {
-                            libc::close(fd);
+                            libc::close(*fd);
                         }
                     }
                 }

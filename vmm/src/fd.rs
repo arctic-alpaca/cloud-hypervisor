@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 
-use log::{debug, warn};
-use option_parser::fd::FdDevice;
+use log::warn;
+pub(crate) use option_parser::fd::{FdDevice, SerializableFd};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::ValidationError;
 use crate::vm_config::VmConfig;
 
 #[derive(Debug, Clone, Copy)]
@@ -25,29 +24,8 @@ impl FdFilter {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct FdMap {
-    #[serde(default, deserialize_with = "deserialize_fd_map_fds")]
-    devices: BTreeMap<FdDevice, Vec<i32>>,
-}
-
-fn deserialize_fd_map_fds<'de, D>(
-    d: D,
-) -> std::result::Result<BTreeMap<FdDevice, Vec<i32>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let mut invalidated_fds: BTreeMap<FdDevice, Vec<i32>> = BTreeMap::deserialize(d)?;
-    invalidated_fds.values_mut().for_each(|fd_vec| {
-        fd_vec.iter_mut().for_each(|fd| {
-            // If the live-migration path is used properly, new FDs are passed as
-            // SCM_RIGHTS message. So, we don't get them from the serialized JSON
-            // anyway.
-            debug!(
-                "FDs in 'FdMap' won't be deserialized as they cannot cross process boundaries. Deserializing them as -1."
-            );
-            *fd = -1;
-        });
-    });
-    Ok(invalidated_fds)
+    #[serde(default)]
+    devices: BTreeMap<FdDevice, Vec<SerializableFd>>,
 }
 
 impl FdMap {
@@ -57,7 +35,20 @@ impl FdMap {
         }
     }
 
-    pub fn insert(&mut self, device: FdDevice, fd: i32, filter: FdFilter) -> bool {
+    #[cfg(test)]
+    pub fn new_with_content(content: &[(FdDevice, Vec<RawFd>)]) -> Self {
+        let mut fd_map = Self::new();
+        content.iter().for_each(|(fd_device, raw_fds)| {
+            let serializable_fds = raw_fds
+                .iter()
+                .map(|raw_fd| SerializableFd::new_valid(*raw_fd))
+                .collect();
+            fd_map.devices.insert(fd_device.clone(), serializable_fds);
+        });
+        fd_map
+    }
+
+    pub fn insert(&mut self, device: FdDevice, fd: SerializableFd, filter: FdFilter) -> bool {
         if filter.filter()(&device) {
             self.devices.entry(device).or_default().push(fd);
             true
@@ -78,10 +69,20 @@ impl FdMap {
         Ok(())
     }
 
-    pub fn ingest_fds(&mut self, fds: Vec<File>) {
-        for (device, fd) in fds.iter().zip(self.devices.values_mut()) {
-            fd.push(device.as_raw_fd());
+    pub fn overwrite_fds_from_scm_rights(&mut self, mut fds: Vec<File>) {
+        // TODO: proper error handling
+        assert_eq!(
+            self.devices.values().flatten().count(),
+            fds.len(),
+            "FD number does not match required number of FDs"
+        );
+        for (device, fd) in fds.drain(..).zip(self.devices.values_mut().flatten()) {
+            *fd = SerializableFd::new_valid(device.as_raw_fd());
         }
+    }
+
+    pub fn extract_fds_for_scm_rights(&mut self) -> Vec<RawFd> {
+        self.devices.values_mut().flatten().map(|fd| **fd).collect()
     }
 
     fn apply_net(&mut self, vm_config: &mut VmConfig) -> Result<(), FdApplyError> {
