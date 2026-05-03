@@ -48,9 +48,9 @@ use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmConfig, VmCounters, VmDelete, VmDiskMirrorStart, VmDiskMirrorStatus, VmNmi, VmPause,
-    VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+    VmConfig, VmCounters, VmDelete, VmDiskMirrorComplete, VmDiskMirrorStart, VmDiskMirrorStatus,
+    VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize,
+    VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -496,6 +496,24 @@ vm_action_put_handler_body!(VmDiskMirrorStatus, |error| match &error {
     ApiError::VmDiskMirrorStatus(VmError::DeviceManager(
         DeviceManagerError::BlockMirrorNotActive(_),
     )) => HttpError::NotFoundWithApiError(error),
+    _ => HttpError::ApiError(error),
+});
+
+vm_action_put_handler_body!(VmDiskMirrorComplete, |error| match &error {
+    ApiError::VmDiskMirrorComplete(VmError::DeviceManager(
+        DeviceManagerError::UnknownDeviceId(_),
+    )) => HttpError::NotFoundWithApiError(error),
+    ApiError::VmDiskMirrorComplete(VmError::DeviceManager(
+        DeviceManagerError::BlockMirrorComplete(MirrorError::NotActive),
+    )) => HttpError::NotFoundWithApiError(error),
+    ApiError::VmDiskMirrorComplete(VmError::DeviceManager(
+        DeviceManagerError::BlockMirrorComplete(
+            MirrorError::DestinationChanged { .. }
+            | MirrorError::DestinationLock { .. }
+            | MirrorError::DevicePaused
+            | MirrorError::NotReady,
+        ),
+    )) => HttpError::BadRequestWithApiError(error),
     _ => HttpError::ApiError(error),
 });
 
