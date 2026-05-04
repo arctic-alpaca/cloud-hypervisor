@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "ivshmem")]
 use std::fs;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::result;
 use std::str::FromStr;
@@ -15,11 +15,11 @@ use std::sync::LazyLock;
 use block::ImageType;
 use clap::ArgMatches;
 use log::warn;
-use option_parser::fd::{FdDevice, SerializableFd};
 use option_parser::{
     ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple,
 };
 use serde::{Deserialize, Serialize};
+use serializable_fd::{FdDevice, SerializableFd};
 use thiserror::Error;
 use virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
 use virtio_bindings::virtio_ids::*;
@@ -27,7 +27,7 @@ use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
 
-use crate::fd::{FdFilter, FdMap};
+use crate::fd::FdMap;
 use crate::landlock::LandlockAccess;
 use crate::vm_config::*;
 
@@ -266,6 +266,11 @@ pub enum ValidationError {
     /// Using reserved fd
     #[error("Reserved fd number (<= 2): {0}")]
     VnetReservedFd(i32),
+    /// An FD is invalid.
+    ///
+    /// This can happen if the fd has not been updated with a valid one after deserialization.
+    #[error("Invalid fd: {0}")]
+    InvalidFd(i32),
     /// Hardware checksum offload is disabled.
     #[error("\"offload_tso\" and \"offload_ufo\" depend on \"offload_csum\"")]
     NoHardwareChecksumOffload,
@@ -1559,7 +1564,11 @@ impl NetConfig {
             .map_err(Error::ParseNetwork)?
             .map(|v| {
                 v.0.iter()
-                    .map(|e| SerializableFd::new_valid(*e as RawFd))
+                    .map(|e| {
+                        println!("{e}");
+                        // SAFETY: TODO(fd)
+                        unsafe { SerializableFd::new_valid_from_raw(*e as RawFd) }
+                    })
                     .collect()
             });
         let pci_segment = parser
@@ -1656,8 +1665,11 @@ impl NetConfig {
             }
 
             for fd in fds {
-                if **fd <= 2 {
-                    return Err(ValidationError::VnetReservedFd(**fd));
+                if fd.as_raw_fd() <= 2 {
+                    return Err(ValidationError::VnetReservedFd(fd.as_raw_fd()));
+                }
+                if !fd.is_valid() {
+                    return Err(ValidationError::InvalidFd(fd.as_raw_fd()));
                 }
             }
         }
@@ -2668,8 +2680,9 @@ pub struct RestoreConfig {
     pub prefault: bool,
     #[serde(default)]
     pub memory_restore_mode: MemoryRestoreMode,
+    /// File descriptors to be restored in the [`VmConfig`].
     #[serde(default)]
-    pub net_fds: Option<FdMap>,
+    pub fds: Option<FdMap>,
     #[serde(default)]
     pub resume: bool,
 }
@@ -2695,7 +2708,7 @@ impl RestoreConfig {
             .add("resume");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
-        let mut net_fds = FdMap::new();
+        let mut fd_map = FdMap::new();
 
         let source_url = parser
             .get("source_url")
@@ -2715,18 +2728,15 @@ impl RestoreConfig {
             .map_err(Error::ParseRestore)?
         {
             v.0.into_iter().for_each(|(fd_device, fds)| {
-                fds.into_iter().for_each(|fd| {
-                    if !net_fds.insert(fd_device.clone(), fd, FdFilter::Net) {
-                        panic!("Invalid FdDevice in net_fds: {fd_device:?}");
-                    }
-                });
+                fds.into_iter()
+                    .for_each(|fd| fd_map.insert(fd_device.clone(), fd));
             });
         }
 
-        let net_fds = if net_fds.is_empty() {
+        let fd_map = if fd_map.is_empty() {
             None
         } else {
-            Some(net_fds)
+            Some(fd_map)
         };
 
         let resume = parser
@@ -2739,7 +2749,7 @@ impl RestoreConfig {
             source_url,
             prefault,
             memory_restore_mode,
-            net_fds,
+            fds: fd_map,
             resume,
         })
     }
@@ -2747,10 +2757,16 @@ impl RestoreConfig {
     // Ensure all net devices from 'VmConfig' backed by FDs have a
     // corresponding 'RestoreNetConfig' with a matched 'id' and expected
     // number of FDs.
-    pub fn validate(&self, _vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
         }
+
+        if let Some(fds) = self.fds {}
+
+        // TODO(fd)
+        // 1. apply FDs
+        // 2. verify all FDs
 
         Ok(())
     }
@@ -3464,7 +3480,6 @@ impl VmConfig {
             pci_segments,
             platform,
             tpm,
-            preserved_fds: None,
             landlock_enable: vm_params.landlock_enable,
             landlock_rules,
             #[cfg(feature = "ivshmem")]
@@ -3544,21 +3559,6 @@ impl VmConfig {
         removed
     }
 
-    /// # Safety
-    /// To use this safely, the caller must guarantee that the input
-    /// fds are all valid.
-    pub unsafe fn add_preserved_fds(&mut self, mut fds: Vec<i32>) {
-        if fds.is_empty() {
-            return;
-        }
-
-        if let Some(preserved_fds) = &self.preserved_fds {
-            fds.append(&mut preserved_fds.clone());
-        }
-
-        self.preserved_fds = Some(fds);
-    }
-
     #[cfg(feature = "tdx")]
     pub fn is_tdx_enabled(&self) -> bool {
         self.platform.as_ref().is_some_and(|p| p.tdx)
@@ -3570,64 +3570,13 @@ impl VmConfig {
     }
 }
 
-impl Clone for VmConfig {
-    fn clone(&self) -> Self {
-        VmConfig {
-            cpus: self.cpus.clone(),
-            memory: self.memory.clone(),
-            payload: self.payload.clone(),
-            rate_limit_groups: self.rate_limit_groups.clone(),
-            disks: self.disks.clone(),
-            net: self.net.clone(),
-            rng: self.rng.clone(),
-            balloon: self.balloon.clone(),
-            #[cfg(feature = "pvmemcontrol")]
-            pvmemcontrol: self.pvmemcontrol.clone(),
-            fs: self.fs.clone(),
-            generic_vhost_user: self.generic_vhost_user.clone(),
-            pmem: self.pmem.clone(),
-            serial: self.serial.clone(),
-            console: self.console.clone(),
-            #[cfg(target_arch = "x86_64")]
-            debug_console: self.debug_console.clone(),
-            devices: self.devices.clone(),
-            user_devices: self.user_devices.clone(),
-            vdpa: self.vdpa.clone(),
-            vsock: self.vsock.clone(),
-            numa: self.numa.clone(),
-            pci_segments: self.pci_segments.clone(),
-            platform: self.platform.clone(),
-            tpm: self.tpm.clone(),
-            preserved_fds: self
-                .preserved_fds
-                .as_ref()
-                // SAFETY: FFI call with valid FDs
-                .map(|fds| fds.iter().map(|fd| unsafe { libc::dup(*fd) }).collect()),
-            landlock_rules: self.landlock_rules.clone(),
-            #[cfg(feature = "ivshmem")]
-            ivshmem: self.ivshmem.clone(),
-            ..*self
-        }
-    }
-}
-
-impl Drop for VmConfig {
-    fn drop(&mut self) {
-        if let Some(mut fds) = self.preserved_fds.take() {
-            for fd in fds.drain(..) {
-                // SAFETY: FFI call with valid FDs
-                unsafe { libc::close(fd) };
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod unit_tests {
     use std::fs::File;
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::IntoRawFd;
 
     use net_util::MacAddr;
+    use serializable_fd::SerializableFd;
 
     use super::*;
 
@@ -4161,19 +4110,31 @@ mod unit_tests {
                 ..net_fixture()
             }
         );
+        {
+            let file_1 = File::open("/dev/null").unwrap();
+            let fd_1 = file_1.try_clone().unwrap().into_raw_fd();
+            let file_2 = File::open("/dev/null").unwrap();
+            let fd_2 = file_2.try_clone().unwrap().into_raw_fd();
 
-        assert_eq!(
-            NetConfig::parse("mac=de:ad:be:ef:12:34,fd=[3,7],num_queues=4")?,
-            NetConfig {
-                host_mac: None,
-                fds: Some(vec![
-                    SerializableFd::new_valid(3),
-                    SerializableFd::new_valid(7)
-                ]),
-                num_queues: 4,
-                ..net_fixture()
-            }
-        );
+            let mut net_config = NetConfig::parse(&format!(
+                "mac=de:ad:be:ef:12:34,fd=[{fd_1},{fd_2}],num_queues=4"
+            ))?;
+
+            let fds = net_config.fds.take().unwrap();
+
+            assert_eq!(fds[0].as_raw_fd(), fd_1);
+            assert_eq!(fds[1].as_raw_fd(), fd_2);
+
+            assert_eq!(
+                net_config,
+                NetConfig {
+                    host_mac: None,
+                    fds: None,
+                    num_queues: 4,
+                    ..net_fixture()
+                }
+            );
+        }
 
         assert_eq!(
             NetConfig::parse("mac=de:ad:be:ef:12:34,mask=255.255.255.0")?,
@@ -4677,7 +4638,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: None,
+                fds: None,
                 resume: false,
             }
         );
@@ -4689,7 +4650,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: Some(FdMap::new_with_content(&[
+                fds: Some(FdMap::new_with_content(&[
                     (
                         FdDevice::Net {
                             id: "net0".to_string()
@@ -4712,7 +4673,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
-                net_fds: None,
+                fds: None,
                 resume: false,
             }
         );
@@ -4722,7 +4683,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: None,
+                fds: None,
                 resume: true,
             }
         );
@@ -4783,7 +4744,6 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             pci_segments: None,
             platform: None,
             tpm: None,
-            preserved_fds: None,
             net: Some(vec![
                 NetConfig {
                     id: Some("net0".to_owned()),
@@ -4821,7 +4781,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
-            net_fds: Some(FdMap::new_with_content(&[
+            fds: Some(FdMap::new_with_content(&[
                 (
                     FdDevice::Net {
                         id: "net0".to_string(),
@@ -4840,7 +4800,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         valid_config.validate(&snapshot_vm_config).unwrap();
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.net_fds = Some(FdMap::new_with_content(&[(
+        invalid_config.fds = Some(FdMap::new_with_content(&[(
             FdDevice::Net {
                 id: "netx".to_string(),
             },
@@ -4853,7 +4813,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ))
         );
 
-        invalid_config.net_fds = Some(FdMap::new_with_content(&[
+        invalid_config.fds = Some(FdMap::new_with_content(&[
             (
                 FdDevice::Net {
                     id: "net0".to_string(),
@@ -4872,7 +4832,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             Err(ValidationError::IdentifierNotUnique("net0".to_string()))
         );
 
-        invalid_config.net_fds = Some(FdMap::new_with_content(&[(
+        invalid_config.fds = Some(FdMap::new_with_content(&[(
             FdDevice::Net {
                 id: "net0".to_string(),
             },
@@ -4885,7 +4845,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ))
         );
 
-        invalid_config.net_fds = Some(FdMap::new_with_content(&[(
+        invalid_config.fds = Some(FdMap::new_with_content(&[(
             FdDevice::Net {
                 id: "net0".to_string(),
             },
@@ -4904,7 +4864,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
-            net_fds: None,
+            fds: None,
             resume: false,
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
@@ -4918,7 +4878,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::OnDemand,
-            net_fds: None,
+            fds: None,
             resume: false,
         };
         assert_eq!(
@@ -5030,7 +4990,6 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             pci_segments: None,
             platform: None,
             tpm: None,
-            preserved_fds: None,
             landlock_enable: false,
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
@@ -5711,17 +5670,6 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ..device_fixture()
         }]);
         still_valid_config.validate().unwrap();
-
-        let mut still_valid_config = valid_config;
-        // SAFETY: Safe as the file was just opened
-        let fd1 = unsafe { libc::dup(File::open("/dev/null").unwrap().as_raw_fd()) };
-        // SAFETY: Safe as the file was just opened
-        let fd2 = unsafe { libc::dup(File::open("/dev/null").unwrap().as_raw_fd()) };
-        // SAFETY: safe as both FDs are valid
-        unsafe {
-            still_valid_config.add_preserved_fds(vec![fd1, fd2]);
-        }
-        let _still_valid_config = still_valid_config.clone();
     }
     #[test]
     fn test_landlock_parsing() -> Result<()> {

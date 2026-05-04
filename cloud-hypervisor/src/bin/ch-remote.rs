@@ -21,6 +21,7 @@ use clap::ArgAction;
 use clap::{Arg, ArgMatches, Command};
 use log::error;
 use option_parser::{ByteSized, ByteSizedParseError};
+use serializable_fd::SerializableFd;
 use thiserror::Error;
 use vmm::config::RestoreConfig;
 use vmm::vm_config::{
@@ -882,19 +883,18 @@ fn add_pmem_config(config: &str) -> Result<String, Error> {
     Ok(pmem_config)
 }
 
-fn add_net_config(config: &str) -> Result<(String, Vec<i32>), Error> {
-    let net_config = NetConfig::parse(config).map_err(Error::AddNetConfig)?;
+fn add_net_config(config: &str) -> Result<(String, Vec<SerializableFd>), Error> {
+    let mut net_config = NetConfig::parse(config).map_err(Error::AddNetConfig)?;
 
-    let fds = net_config
-        .fds
-        .clone()
-        .map(|serializable_fds| {
-            serializable_fds
-                .iter()
-                .map(|serializable_fd| **serializable_fd)
-                .collect()
-        })
-        .unwrap_or_default();
+    let fds = if let Some(serializable_fds) = net_config.fds.as_mut() {
+        serializable_fds
+            .iter_mut()
+            .filter_map(|serializable_fd| serializable_fd.extract_fd())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let net_config = serde_json::to_string(&net_config).unwrap();
 
     Ok((net_config, fds))
@@ -922,12 +922,12 @@ fn snapshot_config(url: &str) -> String {
     serde_json::to_string(&snapshot_config).unwrap()
 }
 
-fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
+fn restore_config(config: &str) -> Result<(String, Vec<SerializableFd>), Error> {
     let mut restore_config = RestoreConfig::parse(config).map_err(Error::Restore)?;
     // RestoreConfig is modified on purpose to take out the file descriptors.
     // These fds are passed to the server side process via SCM_RIGHTS
-    let fds = match &mut restore_config.net_fds {
-        Some(net_fds) => net_fds.extract_fds_for_scm_rights(),
+    let fds = match &mut restore_config.fds {
+        Some(net_fds) => net_fds.extract_fds(),
         None => Vec::new(),
     };
     let restore_config = serde_json::to_string(&restore_config).unwrap();

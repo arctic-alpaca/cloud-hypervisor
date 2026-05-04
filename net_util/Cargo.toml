@@ -12,6 +12,7 @@ libc = { workspace = true }
 log = { workspace = true }
 rate_limiter = { path = "../rate_limiter" }
 serde = { workspace = true, features = ["derive"] }
+serializable_fd = { path = "../serializable_fd" }
 thiserror = { workspace = true }
 virtio-bindings = { workspace = true }
 virtio-queue = { workspace = true }

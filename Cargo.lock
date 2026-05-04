@@ -95,6 +95,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "api_client"
 version = "0.1.0"
 dependencies = [
+ "serializable_fd",
  "thiserror",
  "vmm-sys-util",
 ]
@@ -445,6 +446,7 @@ dependencies = [
  "option_parser",
  "seccompiler",
  "serde_json",
+ "serializable_fd",
  "signal-hook",
  "test_infra",
  "thiserror",
@@ -1390,6 +1392,7 @@ dependencies = [
  "rate_limiter",
  "serde",
  "serde_json",
+ "serializable_fd",
  "thiserror",
  "virtio-bindings",
  "virtio-queue",
@@ -1508,7 +1511,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 name = "option_parser"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "serializable_fd",
  "thiserror",
 ]
 
@@ -2012,6 +2015,15 @@ name = "serial_buffer"
 version = "0.1.0"
 
 [[package]]
+name = "serializable_fd"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2433,6 +2445,7 @@ dependencies = [
  "serde",
  "serde_with",
  "serial_buffer",
+ "serializable_fd",
  "thiserror",
  "vhost",
  "virtio-bindings",
@@ -2557,6 +2570,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_buffer",
+ "serializable_fd",
  "signal-hook",
  "thiserror",
  "tracer",

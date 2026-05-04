@@ -38,7 +38,7 @@ use std::fs::File;
 use std::sync::mpsc::Sender;
 
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
-use option_parser::fd::SerializableFd;
+use serializable_fd::SerializableFd;
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -77,7 +77,7 @@ impl EndpointHandler for VmCreate {
                             Err(e) => return error_response(e, StatusCode::BadRequest),
                         };
 
-                        // TODO: do error handling for invalid SerializableFd
+                        // TODO(fd): do error handling for invalid SerializableFd
                         // if let Some(ref mut nets) = vm_config.net {
                         //     let mut cfgs = nets.iter_mut().collect::<Vec<&mut _>>();
                         //     let cfgs = cfgs.as_mut_slice();
@@ -302,10 +302,10 @@ impl PutHandler for VmRestore {
         if let Some(body) = body {
             let mut restore_cfg: RestoreConfig = serde_json::from_slice(body.raw())?;
 
-            if let Some(net_fds) = restore_cfg.net_fds.as_mut() {
-                //TODO add some checks
-                //TODO: verify the order is stable
-                net_fds.overwrite_fds_from_scm_rights(files);
+            if let Some(restore_config_fds) = restore_cfg.fds.as_mut() {
+                //TODO(fd) add some checks
+                //TODO(fd): verify the order is stable
+                restore_config_fds.update_fds(files);
             }
 
             self.send(api_notifier, api_sender, restore_cfg)

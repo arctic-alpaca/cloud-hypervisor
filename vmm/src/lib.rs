@@ -1777,8 +1777,8 @@ impl RequestHandler for Vmm {
             .validate(&vm_config.lock().unwrap().clone())
             .map_err(VmError::ConfigValidation)?;
         // Update VM's net configurations with new fds received for restore operation
-        if let Some(net_fds) = restore_cfg.net_fds {
-            //TODO: handle errors
+        if let Some(net_fds) = restore_cfg.fds {
+            //TODO(fd): handle errors
             net_fds.apply(&mut vm_config.lock().unwrap()).unwrap();
         }
 
@@ -2572,7 +2572,6 @@ mod unit_tests {
             pci_segments: None,
             platform: None,
             tpm: None,
-            preserved_fds: None,
             landlock_enable: false,
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]

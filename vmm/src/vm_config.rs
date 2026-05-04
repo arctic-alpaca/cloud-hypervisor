@@ -13,11 +13,11 @@ pub use block::fcntl::LockGranularityChoice;
 use log::warn;
 use net_util::MacAddr;
 use serde::{Deserialize, Serialize};
+use serializable_fd::SerializableFd;
 use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
 
 use crate::Landlock;
-use crate::fd::SerializableFd;
 use crate::landlock::LandlockError;
 
 pub type LandlockResult<T> = result::Result<T, LandlockError>;
@@ -941,7 +941,7 @@ impl ApplyLandlock for LandlockConfig {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct VmConfig {
     #[serde(default)]
     pub cpus: CpusConfig,
@@ -984,16 +984,6 @@ pub struct VmConfig {
     pub pci_segments: Option<Vec<PciSegmentConfig>>,
     pub platform: Option<PlatformConfig>,
     pub tpm: Option<TpmConfig>,
-    // Preserved FDs are the ones that share the same life-time as its holding
-    // VmConfig instance, such as FDs for creating TAP devices.
-    // Preserved FDs will stay open as long as the holding VmConfig instance is
-    // valid, and will be closed when the holding VmConfig instance is destroyed.
-    //
-    // This is populated as devices are added at runtime. Removing them again
-    // causes the FDs to be closed early. This allows management software to
-    // gracefully clean up resources (e.g., libvirt closes tap devices).
-    #[serde(skip)]
-    pub preserved_fds: Option<Vec<i32>>,
     #[serde(default)]
     pub landlock_enable: bool,
     pub landlock_rules: Option<Vec<LandlockConfig>>,

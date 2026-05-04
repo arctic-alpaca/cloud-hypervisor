@@ -2,37 +2,41 @@
 
 ## Use Cases
 
-- Live migration
-  - ...
-- Live update for CHV
-  - ...
-- VM creation
-  - ...
-- Add net 
-- Add blk
-- Exporting FDs for safekeeping during updates/migrations/???
+- Ingest FDs
+  - Live migration
+  - Live update for CHV
+  - VM creation
+  - Add device 
+- Export FDs
+  - Live migration
+  - Live update for CHV
+  - external clean-up by management software (?)
 
-## Things that are FDs
 
-- serial
-- console
-- disk
-- fs
-- pmem
-- (vfio-)user-device
-- (vfio-)device
-- vsock
-- vdpa
-- virtio-device-backend
-- memory
-- vCPUs
-- VM
-- vhost-user-{net,block,fs,...}
-- files
-  - api socket
-  - event monitor
-  - 
+## API
 
+### D-BUS
+
+FDs are not supported
+
+### CLI
+
+FDs passed in via commandline are immediately valid.
+
+### HTTP
+
+FDs passed in via HTTP API are invalid and need to be combined with SCM_RIGHTS messages to form valid FDs.
+
+
+## Design
+
+### Requirements
+
+- FDs must be de-/serializable (HTTP)
+  - FDs must become invalid when serializing
+  - FDs can be updated with valid FDs
+- FDs must be identifiable to replace invalid FDs with the correct valid ones
+- FDs must be 
 
 ## Where do FDs come from?
 
@@ -96,4 +100,6 @@ Optional:
 - https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/docs/macvtap-bridge.md
 - https://github.com/cloud-hypervisor/cloud-hypervisor/issues/6286
 - https://github.com/cloud-hypervisor/cloud-hypervisor/issues/7704
-- 
+- https://github.com/cloud-hypervisor/cloud-hypervisor/pull/5373
+- https://github.com/cloud-hypervisor/cloud-hypervisor/pull/2516
+- https://github.com/cloud-hypervisor/libvirt/issues/84
