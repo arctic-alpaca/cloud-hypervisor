@@ -2762,7 +2762,10 @@ impl RestoreConfig {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
         }
 
-        if let Some(fds) = self.fds {}
+        if let Some(fds) = &self.fds {
+            // TODO(fd): error handling
+            fds.validate(vm_config).unwrap();
+        }
 
         // TODO(fd)
         // 1. apply FDs

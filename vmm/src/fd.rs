@@ -45,16 +45,6 @@ impl FdMap {
         self.devices.is_empty()
     }
 
-    pub fn apply(self, vm_config: &mut VmConfig) -> Result<(), FdApplyError> {
-        for (device, fds) in self.devices.into_iter() {
-            match device {
-                FdDevice::Net { ref id } => Self::apply_net(id, fds, vm_config)?,
-            }
-        }
-
-        Ok(())
-    }
-
     pub fn update_fds(&mut self, mut fds: Vec<File>) {
         // TODO(fd): proper error handling
         assert_eq!(
@@ -73,6 +63,59 @@ impl FdMap {
             .flatten()
             .filter_map(|fd| fd.extract_fd())
             .collect()
+    }
+
+    pub fn apply(self, vm_config: &mut VmConfig) -> Result<(), FdApplyError> {
+        for (device, fds) in self.devices.into_iter() {
+            match device {
+                FdDevice::Net { ref id } => Self::apply_net(id, fds, vm_config)?,
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate(&self, vm_config: &VmConfig) -> Result<(), FdApplyError> {
+        for (device, fds) in self.devices.iter() {
+            match &device {
+                FdDevice::Net { id } => Self::validate_net(id, fds, vm_config)?,
+            }
+        }
+
+        Ok(())
+    }
+    fn validate_net(
+        net_device_id: &String,
+        fds: &[SerializableFd],
+        vm_config: &VmConfig,
+    ) -> Result<(), FdApplyError> {
+        let Some(net_configs) = vm_config.net.as_ref() else {
+            return Err(FdApplyError::Todo(
+                "VM config is missing net devices".to_owned(),
+            ));
+        };
+        let Some(net_config) = net_configs
+            .iter()
+            .find(|config| config.id.as_ref() == Some(net_device_id))
+        else {
+            return Err(FdApplyError::Todo(format!(
+                "could not find net device with id {net_device_id}"
+            )));
+        };
+
+        let Some(outdated_net_fds) = net_config.fds.as_ref() else {
+            return Err(FdApplyError::Todo(format!(
+                "cannot restore FDs for {net_device_id}, device does not use FDs"
+            )));
+        };
+
+        if outdated_net_fds.len() != fds.len() {
+            return Err(FdApplyError::Todo(
+                "FD count mismatch between config and device".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn apply_net(
@@ -108,6 +151,7 @@ impl FdMap {
 
         outdated_net_fds.clear();
         outdated_net_fds.append(&mut fds);
+
         Ok(())
     }
 }
