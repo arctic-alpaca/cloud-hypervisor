@@ -1,0 +1,15 @@
+[package]
+edition.workspace = true
+name = "serializable_fd"
+version = "0.1.0"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_with = { workspace = true, features = ["macros", "alloc"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

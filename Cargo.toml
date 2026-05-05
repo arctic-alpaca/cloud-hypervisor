@@ -42,6 +42,7 @@ members = [
   "performance-metrics",
   "rate_limiter",
   "serial_buffer",
+  "serializable_fd",
   "test_infra",
   "tracer",
   "vhost_user_block",
