@@ -41,6 +41,7 @@ use std::sync::mpsc::{RecvError, SendError, Sender, channel};
 use log::{info, trace};
 use micro_http::Body;
 use serde::{Deserialize, Serialize};
+use serializable_fd::FdMap;
 use thiserror::Error;
 use vm_migration::MigratableError;
 use vm_migration::progress::MigrationProgress;
@@ -50,7 +51,7 @@ use vmm_sys_util::eventfd::EventFd;
 pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
-use crate::config::{RestoreConfig, RestoredNetConfig};
+use crate::config::RestoreConfig;
 use crate::device_tree::DeviceTree;
 use crate::vm::{Error as VmError, VmState};
 use crate::vm_config::{
@@ -280,7 +281,7 @@ pub struct VmReceiveMigrationData {
     pub tcp_serial_url: Option<String>,
     /// Map with new network FDs on the new host.
     #[serde(default)]
-    pub net_fds: Vec<RestoredNetConfig>,
+    pub net_fds: FdMap,
     /// Directory containing the TLS server certificate (server-cert.pem) and TLS server key (server-key.pem).
     #[serde(default)]
     pub tls_dir: Option<PathBuf>,

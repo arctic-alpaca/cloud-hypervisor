@@ -8,6 +8,7 @@ version = "0.1.0"
 [dependencies]
 thiserror = { workspace = true }
 vmm-sys-util = { workspace = true }
+serializable_fd = { path = "../serializable_fd" }
 
 [lints]
 workspace = true

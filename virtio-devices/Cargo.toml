@@ -47,6 +47,7 @@ vm-memory = { workspace = true, features = [
 vm-migration = { path = "../vm-migration" }
 vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = { workspace = true }
+serializable_fd = { path = "../serializable_fd" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

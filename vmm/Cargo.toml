@@ -96,6 +96,7 @@ vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = { workspace = true, features = ["with-serde"] }
 zbus = { version = "5.13.2", optional = true }
 zerocopy = { workspace = true, features = ["alloc", "derive"] }
+serializable_fd = { path = "../serializable_fd" }
 
 [lints]
 workspace = true

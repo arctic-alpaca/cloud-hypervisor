@@ -49,6 +49,7 @@ use pci::PciBdf;
 use seccompiler::{SeccompAction, apply_filter};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
+use serializable_fd::FdSerialization;
 use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
 use tracer::trace_scoped;
@@ -2162,7 +2163,7 @@ impl Vmm {
         socket: &mut SocketStream,
         state: ReceiveMigrationState,
         req: &Request,
-        receive_data_migration: &VmReceiveMigrationData,
+        mut receive_data_migration: VmReceiveMigrationData,
     ) -> std::result::Result<ReceiveMigrationState, MigratableError> {
         use ReceiveMigrationState::*;
 
@@ -2194,15 +2195,7 @@ impl Vmm {
             // Apply external FDs to virtio-net devices.
             if !receive_data_migration.net_fds.is_empty() {
                 let mut vm_config = self.vm_config.as_mut().unwrap().lock().unwrap();
-                for restore_net_cfg in &receive_data_migration.net_fds {
-                    for net_cfg in vm_config.net.iter_mut().flatten() {
-                        // update only if the net dev is backed by FDs
-                        if net_cfg.id.as_ref() == Some(&restore_net_cfg.id) && net_cfg.fds.is_some()
-                        {
-                            net_cfg.fds.clone_from(&restore_net_cfg.fds);
-                        }
-                    }
-                }
+                vm_config.apply_fd_map(&mut receive_data_migration.net_fds);
             }
 
             let guest_memory = memory_manager.lock().unwrap().guest_memory();
@@ -3607,17 +3600,12 @@ impl RequestHandler for Vmm {
             .map_err(VmError::ConfigValidation)?;
 
         // Update VM's net configurations with new fds received for restore operation
-        if let (Some(restored_nets), Some(vm_net_configs)) =
+        if let (Some(mut restored_nets), Some(vm_net_configs)) =
             (restore_cfg.net_fds, &mut vm_config.lock().unwrap().net)
         {
-            for net in restored_nets.iter() {
-                for net_config in vm_net_configs.iter_mut() {
-                    // update only if the net dev is backed by FDs
-                    if net_config.id.as_ref() == Some(&net.id) && net_config.fds.is_some() {
-                        net_config.fds.clone_from(&net.fds);
-                    }
-                }
-            }
+            vm_net_configs
+                .iter_mut()
+                .for_each(|net_config| net_config.apply_fd_map(&mut restored_nets));
         }
 
         self.vm_restore(source_url, vm_config, restore_cfg.prefault)
@@ -4228,7 +4216,7 @@ impl RequestHandler for Vmm {
                 &mut socket,
                 state,
                 &req,
-                &receive_data_migration,
+                receive_data_migration.clone(),
             ) {
                 Ok(next_state) => (Response::ok(), next_state, None),
                 Err(err) => {
