@@ -239,6 +239,7 @@ impl PutHandler for VmAddNet {
     ) -> std::result::Result<Option<Body>, HttpError> {
         if let Some(body) = body {
             let mut net_cfg: NetConfig = serde_json::from_slice(body.raw())?;
+            info!("{}", str::from_utf8(body.raw()).unwrap());
             net_cfg.update_fds(files);
 
             self.send(api_notifier, api_sender, net_cfg)
@@ -262,6 +263,7 @@ impl PutHandler for VmReceiveMigration {
         files: Vec<File>,
     ) -> std::result::Result<Option<Body>, HttpError> {
         if let Some(body) = body {
+            info!("{}", str::from_utf8(body.raw()).unwrap());
             let mut net_cfg: VmReceiveMigrationData = serde_json::from_slice(body.raw())?;
             net_cfg.net_fds.update_fds(files);
 
@@ -343,6 +345,7 @@ impl PutHandler for VmRestore {
         files: Vec<File>,
     ) -> std::result::Result<Option<Body>, HttpError> {
         if let Some(body) = body {
+            info!("{}", str::from_utf8(body.raw()).unwrap());
             let mut restore_cfg: RestoreConfig = serde_json::from_slice(body.raw())?;
 
             if let Some(fd_map) = restore_cfg.net_fds.as_mut() {
