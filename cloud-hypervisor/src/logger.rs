@@ -5,7 +5,7 @@
 
 use std::io::Write;
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use thiserror::Error;
 
@@ -92,36 +92,11 @@ pub const DEFAULT_FORMAT: &str =
     "cloud-hypervisor: {boottime}s: <{thread}> {level}:{location} -- {msg}";
 
 fn write_wallclock(out: &mut dyn Write) -> std::io::Result<()> {
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    // libc plans to make time_t 64-bit (see libc#1848); already i64 on our targets
-    #[allow(deprecated)]
-    let secs = dur.as_secs() as libc::time_t;
-    let us = dur.subsec_micros();
-
-    // SAFETY: zeroed memory is valid for libc::tm, and gmtime_r is
-    // thread-safe, writing into our stack-local tm.
-    let tm = unsafe {
-        let mut tm = std::mem::zeroed::<libc::tm>();
-        libc::gmtime_r(&secs, &mut tm);
-        tm
-    };
-
-    let mut buf = [0u8; 32];
-    // SAFETY: strftime writes a null-terminated string into buf.
-    // "%Y-%m-%dT%H:%M:%S" produces exactly 19 bytes, well within 32.
-    let len = unsafe {
-        libc::strftime(
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            c"%Y-%m-%dT%H:%M:%S".as_ptr(),
-            &tm,
-        )
-    };
-
-    out.write_all(&buf[..len])?;
-    write!(out, ".{us:06}Z")
+    write!(
+        out,
+        "{}:Z",
+        jiff::Zoned::now().strftime("%Y-%m-%dT%H:%M:%S%.5f")
+    )
 }
 
 pub struct Logger {

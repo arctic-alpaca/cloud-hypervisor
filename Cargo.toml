@@ -54,6 +54,7 @@ resolver = "3"
 # rust-vmm crates
 acpi_tables = "0.2.0"
 iommufd-ioctls = "0.1.0"
+jiff = { version = "0.2.24", default-features = false }
 kvm-bindings = "0.14.0"
 kvm-ioctls = "0.24.0"
 linux-loader = "0.13.2"
