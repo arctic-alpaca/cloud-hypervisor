@@ -5,7 +5,7 @@
 
 use std::io::Write;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
@@ -22,6 +22,9 @@ pub enum Error {
 enum Token {
     Literal(String),
     BootTime,
+    WallClock,
+    Pid,
+    Tid,
     Thread,
     Level,
     Location,
@@ -57,6 +60,9 @@ fn parse_format(fmt: &str) -> Result<Vec<Token>, Error> {
 
                 let token = match name.as_str() {
                     "boottime" => Token::BootTime,
+                    "wallclock" => Token::WallClock,
+                    "pid" => Token::Pid,
+                    "tid" => Token::Tid,
                     "thread" => Token::Thread,
                     "level" => Token::Level,
                     "location" => Token::Location,
@@ -85,9 +91,43 @@ fn parse_format(fmt: &str) -> Result<Vec<Token>, Error> {
 pub const DEFAULT_FORMAT: &str =
     "cloud-hypervisor: {boottime}s: <{thread}> {level}:{location} -- {msg}";
 
+fn write_wallclock(out: &mut dyn Write) -> std::io::Result<()> {
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    // libc plans to make time_t 64-bit (see libc#1848); already i64 on our targets
+    #[allow(deprecated)]
+    let secs = dur.as_secs() as libc::time_t;
+    let us = dur.subsec_micros();
+
+    // SAFETY: zeroed memory is valid for libc::tm, and gmtime_r is
+    // thread-safe, writing into our stack-local tm.
+    let tm = unsafe {
+        let mut tm = std::mem::zeroed::<libc::tm>();
+        libc::gmtime_r(&secs, &mut tm);
+        tm
+    };
+
+    let mut buf = [0u8; 32];
+    // SAFETY: strftime writes a null-terminated string into buf.
+    // "%Y-%m-%dT%H:%M:%S" produces exactly 19 bytes, well within 32.
+    let len = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            c"%Y-%m-%dT%H:%M:%S".as_ptr(),
+            &tm,
+        )
+    };
+
+    out.write_all(&buf[..len])?;
+    write!(out, ".{us:06}Z")
+}
+
 pub struct Logger {
     output: Mutex<Box<dyn Write + Send>>,
     start: Instant,
+    pid: u32,
     tokens: Vec<Token>,
 }
 
@@ -96,6 +136,7 @@ impl Logger {
         Ok(Self {
             output: Mutex::new(output),
             start: Instant::now(),
+            pid: std::process::id(),
             tokens: parse_format(format)?,
         })
     }
@@ -118,6 +159,10 @@ impl log::Log for Logger {
                 Token::Literal(s) => out.write_all(s.as_bytes()),
                 // 10: 6 decimal places + sep => whole seconds in range `0..=999` properly aligned
                 Token::BootTime => write!(&mut *out, "{duration_s:>10.6?}"),
+                Token::WallClock => write_wallclock(&mut *out),
+                Token::Pid => write!(&mut *out, "{}", self.pid),
+                // SAFETY: gettid(2) always succeeds
+                Token::Tid => write!(&mut *out, "{}", unsafe { libc::gettid() }),
                 Token::Thread => write!(
                     &mut *out,
                     "{}",
@@ -174,6 +219,9 @@ mod tests {
             .map(|t| match t {
                 Token::Literal(s) => format!("L({s})"),
                 Token::BootTime => "B".to_string(),
+                Token::WallClock => "W".to_string(),
+                Token::Pid => "P".to_string(),
+                Token::Tid => "I".to_string(),
                 Token::Thread => "T".to_string(),
                 Token::Level => "V".to_string(),
                 Token::Location => "O".to_string(),
@@ -197,8 +245,14 @@ mod tests {
 
     #[test]
     fn parse_all_known_tokens() {
-        let tokens = parse_format("[{boottime}] <{thread}> {level} {location} -- {msg}").unwrap();
-        assert_eq!(render(&tokens), "L([)|B|L(] <)|T|L(> )|V|L( )|O|L( -- )|M");
+        let tokens = parse_format(
+            "[{boottime}] {wallclock} {pid}/{tid} <{thread}> {level} {location} -- {msg}",
+        )
+        .unwrap();
+        assert_eq!(
+            render(&tokens),
+            "L([)|B|L(] )|W|L( )|P|L(/)|I|L( <)|T|L(> )|V|L( )|O|L( -- )|M"
+        );
     }
 
     #[test]
@@ -318,6 +372,68 @@ mod tests {
         let out = buf.contents();
         assert!(out.contains("my_target"), "got: {out}");
         assert!(!out.contains("foo.rs"), "got: {out}");
+    }
+
+    #[test]
+    fn logger_wallclock_is_rfc3339() {
+        let buf = SharedBuffer::default();
+        let logger = Logger::new(Box::new(buf.clone()), "{wallclock}").unwrap();
+
+        logger.log(
+            &log::Record::builder()
+                .args(format_args!(""))
+                .level(log::Level::Info)
+                .target("t")
+                .build(),
+        );
+
+        let out = buf.contents();
+        let out = out.trim();
+        assert_eq!(out.len(), 27, "got: {out}");
+        assert!(out.ends_with('Z'), "got: {out}");
+        assert_eq!(&out[4..5], "-", "got: {out}");
+        assert_eq!(&out[7..8], "-", "got: {out}");
+        assert_eq!(&out[10..11], "T", "got: {out}");
+        assert_eq!(&out[13..14], ":", "got: {out}");
+        assert_eq!(&out[16..17], ":", "got: {out}");
+        assert_eq!(&out[19..20], ".", "got: {out}");
+    }
+
+    #[test]
+    fn logger_pid_token() {
+        let buf = SharedBuffer::default();
+        let logger = Logger::new(Box::new(buf.clone()), "{pid}").unwrap();
+
+        logger.log(
+            &log::Record::builder()
+                .args(format_args!(""))
+                .level(log::Level::Info)
+                .target("t")
+                .build(),
+        );
+
+        let out = buf.contents();
+        let out = out.trim();
+        assert_eq!(out, std::process::id().to_string(), "got: {out}");
+    }
+
+    #[test]
+    fn logger_tid_token() {
+        let buf = SharedBuffer::default();
+        let logger = Logger::new(Box::new(buf.clone()), "{tid}").unwrap();
+
+        logger.log(
+            &log::Record::builder()
+                .args(format_args!(""))
+                .level(log::Level::Info)
+                .target("t")
+                .build(),
+        );
+
+        let out = buf.contents();
+        let out = out.trim();
+        let tid: i64 = out.parse().expect("tid should be numeric");
+        assert!(tid > 0, "got: {tid}");
     }
 
     #[test]
