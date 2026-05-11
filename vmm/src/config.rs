@@ -2615,20 +2615,7 @@ impl RestoreConfig {
         let net_fds = parser
             .convert::<Tuple<FdDevice, Vec<u64>>>("net_fds")
             .map_err(Error::ParseRestore)?
-            .map(|v| {
-                v.0.into_iter()
-                    .fold(FdMap::new(), |mut accumulator, (fd_device, fds)| {
-                        let fds: Vec<_> = fds
-                            .into_iter()
-                            .map(|fd| {
-                                // SAFETY: TODO(fd)
-                                unsafe { SerializableFd::new_active_from_raw(fd as RawFd) }
-                            })
-                            .collect();
-                        accumulator.insert(fd_device, fds);
-                        accumulator
-                    })
-            });
+            .map(|v| FdMap::from_iter(v.0));
 
         Ok(RestoreConfig {
             source_url,
@@ -2645,7 +2632,7 @@ impl RestoreConfig {
             && !net_fds.can_update(&vm_config.create_fd_map())
         {
             //TODO(fd)
-            panic!("")
+            panic!("failed to validate")
         }
 
         Ok(())
