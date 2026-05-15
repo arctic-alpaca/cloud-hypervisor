@@ -1477,7 +1477,7 @@ impl DiskConfig {
                 v.0.iter()
                     .map(|(e1, e2)| VirtQueueAffinity {
                         queue_index: *e1,
-                        host_cpus: e2.clone(),
+                        host_cpus: e2.clone().into_boxed_slice(),
                     })
                     .collect()
             });
@@ -2556,7 +2556,7 @@ impl NumaConfig {
         let memory_zones = parser
             .convert::<StringList>("memory_zones")
             .map_err(Error::ParseNuma)?
-            .map(|v| v.0);
+            .map(|v| v.0.into_boxed_slice());
         let pci_segments = parser
             .convert::<IntegerList>("pci_segments")
             .map_err(Error::ParseNuma)?
@@ -3337,14 +3337,14 @@ impl VmConfig {
     }
 
     pub fn parse(vm_params: VmParams) -> Result<Self> {
-        let mut rate_limit_groups: Option<Vec<RateLimiterGroupConfig>> = None;
+        let mut rate_limit_groups: Option<Box<[RateLimiterGroupConfig]>> = None;
         if let Some(rate_limit_group_list) = &vm_params.rate_limit_groups {
             let mut rate_limit_group_config_list = Vec::new();
             for item in rate_limit_group_list.iter() {
                 let rate_limit_group_config = RateLimiterGroupConfig::parse(item)?;
                 rate_limit_group_config_list.push(rate_limit_group_config);
             }
-            rate_limit_groups = Some(rate_limit_group_config_list);
+            rate_limit_groups = Some(rate_limit_group_config_list.into_boxed_slice());
         }
 
         let mut disks: Option<Vec<DiskConfig>> = None;
@@ -3456,26 +3456,26 @@ impl VmConfig {
             vsock = Some(vsock_config);
         }
 
-        let mut pci_segments: Option<Vec<PciSegmentConfig>> = None;
+        let mut pci_segments: Option<Box<[PciSegmentConfig]>> = None;
         if let Some(pci_segment_list) = &vm_params.pci_segments {
             let mut pci_segment_config_list = Vec::new();
             for item in pci_segment_list.iter() {
                 let pci_segment_config = PciSegmentConfig::parse(item)?;
                 pci_segment_config_list.push(pci_segment_config);
             }
-            pci_segments = Some(pci_segment_config_list);
+            pci_segments = Some(pci_segment_config_list.into_boxed_slice());
         }
 
         let platform = vm_params.platform.map(PlatformConfig::parse).transpose()?;
 
-        let mut numa: Option<Vec<NumaConfig>> = None;
+        let mut numa: Option<Box<[NumaConfig]>> = None;
         if let Some(numa_list) = &vm_params.numa {
             let mut numa_config_list = Vec::new();
             for item in numa_list.iter() {
                 let numa_config = NumaConfig::parse(item)?;
                 numa_config_list.push(numa_config);
             }
-            numa = Some(numa_config_list);
+            numa = Some(numa_config_list.into_boxed_slice());
         }
 
         #[cfg(not(feature = "igvm"))]
@@ -3513,13 +3513,14 @@ impl VmConfig {
         #[cfg(feature = "guest_debug")]
         let gdb = vm_params.gdb;
 
-        let mut landlock_rules: Option<Vec<LandlockConfig>> = None;
+        let mut landlock_rules: Option<Box<[LandlockConfig]>> = None;
         if let Some(ll_rules) = vm_params.landlock_rules {
             landlock_rules = Some(
                 ll_rules
                     .iter()
                     .map(|rule| LandlockConfig::parse(rule))
-                    .collect::<Result<Vec<LandlockConfig>>>()?,
+                    .collect::<Result<Vec<LandlockConfig>>>()?
+                    .into_boxed_slice(),
             );
         }
 
@@ -4172,24 +4173,24 @@ mod unit_tests {
         assert_eq!(
             DiskConfig::parse("path=/path/to_file,queue_affinity=[0@[1],1@[2],2@[3,4],3@[5-8]]")?,
             DiskConfig {
-                queue_affinity: Some(vec![
+                queue_affinity: Some(Box::new([
                     VirtQueueAffinity {
                         queue_index: 0,
-                        host_cpus: vec![1],
+                        host_cpus: Box::new([1]),
                     },
                     VirtQueueAffinity {
                         queue_index: 1,
-                        host_cpus: vec![2],
+                        host_cpus: Box::new([2]),
                     },
                     VirtQueueAffinity {
                         queue_index: 2,
-                        host_cpus: vec![3, 4],
+                        host_cpus: Box::new([3, 4]),
                     },
                     VirtQueueAffinity {
                         queue_index: 3,
-                        host_cpus: vec![5, 6, 7, 8],
+                        host_cpus: Box::new([5, 6, 7, 8]),
                     }
-                ]),
+                ])),
                 ..disk_fixture()
             }
         );
@@ -4702,14 +4703,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                                 memory_zones=[mem0],pci_segments=[0]";
         let expected_standard = NumaConfig {
             guest_numa_id: 1,
-            cpus: Some(vec![2, 3]),
-            distances: Some(vec![NumaDistance {
+            cpus: Some(Box::new([2, 3])),
+            distances: Some(Box::new([NumaDistance {
                 destination: 0,
                 distance: 20,
-            }]),
+            }])),
             device_id: None,
-            memory_zones: Some(vec!["mem0".to_string()]),
-            pci_segments: Some(vec![0]),
+            memory_zones: Some(Box::new(["mem0".to_string()])),
+            pci_segments: Some(Box::new([0])),
         };
         assert_eq!(NumaConfig::parse(standard_input)?, expected_standard);
         // Successful generic initiator config parse
@@ -4717,13 +4718,13 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let expected_gi = NumaConfig {
             guest_numa_id: 2,
             cpus: None,
-            distances: Some(vec![NumaDistance {
+            distances: Some(Box::new([NumaDistance {
                 destination: 0,
                 distance: 30,
-            }]),
+            }])),
             device_id: Some("vfio1".to_string()),
             memory_zones: None,
-            pci_segments: Some(vec![1]),
+            pci_segments: Some(Box::new([1])),
         };
         assert_eq!(NumaConfig::parse(gi_input)?, expected_gi);
         Ok(())
@@ -4735,10 +4736,10 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let config = NumaConfig {
             guest_numa_id: 0,
             cpus: None,
-            distances: Some(vec![NumaDistance {
+            distances: Some(Box::new([NumaDistance {
                 destination: 1,
                 distance: 20,
-            }]),
+            }])),
             memory_zones: None,
             device_id: Some("vfio0".to_string()),
             pci_segments: None,
@@ -4766,7 +4767,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         // device_id and cpus specified
         let config = NumaConfig {
             guest_numa_id: 0,
-            cpus: Some(vec![0, 1]),
+            cpus: Some(Box::new([0, 1])),
             distances: None,
             device_id: Some("vfio0".to_string()),
             memory_zones: None,
@@ -4783,7 +4784,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             cpus: None,
             distances: None,
             device_id: Some("vfio0".to_string()),
-            memory_zones: Some(vec!["mem0".to_string()]),
+            memory_zones: Some(Box::new(["mem0".to_string()])),
             pci_segments: None,
         };
         assert!(config.validate().is_err());
@@ -4794,13 +4795,13 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         // No device_id
         let config = NumaConfig {
             guest_numa_id: 0,
-            cpus: Some(vec![0, 1]),
-            distances: Some(vec![NumaDistance {
+            cpus: Some(Box::new([0, 1])),
+            distances: Some(Box::new([NumaDistance {
                 destination: 1,
                 distance: 20,
-            }]),
+            }])),
             device_id: None,
-            memory_zones: Some(vec!["mem0".to_string()]),
+            memory_zones: Some(Box::new(["mem0".to_string()])),
             pci_segments: None,
         };
         config.validate().unwrap();
@@ -5517,14 +5518,17 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         still_valid_config.validate().unwrap();
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![MAX_NUM_PCI_SEGMENTS + 1, MAX_NUM_PCI_SEGMENTS + 2]),
+            iommu_segments: Some(Box::new([
+                MAX_NUM_PCI_SEGMENTS + 1,
+                MAX_NUM_PCI_SEGMENTS + 2,
+            ])),
             ..platform_fixture()
         });
         assert_eq!(
@@ -5546,7 +5550,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         still_valid_config.disks = Some(vec![DiskConfig {
@@ -5561,7 +5565,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         still_valid_config.net = Some(vec![NetConfig {
@@ -5576,7 +5580,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         still_valid_config.pmem = Some(vec![PmemConfig {
@@ -5591,7 +5595,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         still_valid_config.devices = Some(vec![DeviceConfig {
@@ -5606,7 +5610,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         still_valid_config.vsock = Some(VsockConfig {
@@ -5622,7 +5626,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         invalid_config.disks = Some(vec![DiskConfig {
@@ -5640,7 +5644,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         invalid_config.net = Some(vec![NetConfig {
@@ -5659,7 +5663,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
             num_pci_segments: MAX_NUM_PCI_SEGMENTS,
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         invalid_config.pmem = Some(vec![PmemConfig {
@@ -5677,7 +5681,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
             num_pci_segments: MAX_NUM_PCI_SEGMENTS,
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         invalid_config.devices = Some(vec![DeviceConfig {
@@ -5694,7 +5698,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         invalid_config.vsock = Some(VsockConfig {
@@ -5713,7 +5717,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut invalid_config = valid_config.clone();
         invalid_config.memory.shared = true;
         invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         invalid_config.user_devices = Some(vec![UserDeviceConfig {
@@ -5730,7 +5734,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         invalid_config.vdpa = Some(vec![VdpaConfig {
@@ -5748,7 +5752,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut invalid_config = valid_config.clone();
         invalid_config.memory.shared = true;
         invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(vec![1, 2, 3]),
+            iommu_segments: Some(Box::new([1, 2, 3])),
             ..platform_fixture()
         });
         invalid_config.fs = Some(vec![FsConfig {
@@ -5768,81 +5772,81 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             num_pci_segments: 2,
             ..platform_fixture()
         });
-        invalid_config.numa = Some(vec![
+        invalid_config.numa = Some(Box::new([
             NumaConfig {
                 guest_numa_id: 0,
-                cpus: Some(vec![0]),
-                pci_segments: Some(vec![1]),
+                cpus: Some(Box::new([0])),
+                pci_segments: Some(Box::new([1])),
                 ..numa_fixture()
             },
             NumaConfig {
                 guest_numa_id: 1,
-                cpus: Some(vec![1]),
-                pci_segments: Some(vec![1]),
+                cpus: Some(Box::new([1])),
+                pci_segments: Some(Box::new([1])),
                 ..numa_fixture()
             },
-        ]);
+        ]));
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::PciSegmentReused(1, 0, 1))
         );
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.pci_segments = Some(vec![PciSegmentConfig {
+        invalid_config.pci_segments = Some(Box::new([PciSegmentConfig {
             pci_segment: 0,
             mmio32_aperture_weight: 1,
             mmio64_aperture_weight: 0,
-        }]);
+        }]));
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::InvalidPciSegmentApertureWeight(0))
         );
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.pci_segments = Some(vec![PciSegmentConfig {
+        invalid_config.pci_segments = Some(Box::new([PciSegmentConfig {
             pci_segment: 0,
             mmio32_aperture_weight: 0,
             mmio64_aperture_weight: 1,
-        }]);
+        }]));
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::InvalidPciSegmentApertureWeight(0))
         );
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.numa = Some(vec![
+        invalid_config.numa = Some(Box::new([
             NumaConfig {
                 guest_numa_id: 0,
-                cpus: Some(vec![0]),
+                cpus: Some(Box::new([0])),
                 ..numa_fixture()
             },
             NumaConfig {
                 guest_numa_id: 1,
-                cpus: Some(vec![1]),
-                pci_segments: Some(vec![0]),
+                cpus: Some(Box::new([1])),
+                pci_segments: Some(Box::new([0])),
                 ..numa_fixture()
             },
-        ]);
+        ]));
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::DefaultPciSegmentInvalidNode(1))
         );
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.numa = Some(vec![
+        invalid_config.numa = Some(Box::new([
             NumaConfig {
                 guest_numa_id: 0,
-                cpus: Some(vec![0]),
-                pci_segments: Some(vec![0]),
+                cpus: Some(Box::new([0])),
+                pci_segments: Some(Box::new([0])),
                 ..numa_fixture()
             },
             NumaConfig {
                 guest_numa_id: 1,
-                cpus: Some(vec![1]),
-                pci_segments: Some(vec![1]),
+                cpus: Some(Box::new([1])),
+                pci_segments: Some(Box::new([1])),
                 ..numa_fixture()
             },
-        ]);
+        ]));
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::InvalidPciSegment(1))
