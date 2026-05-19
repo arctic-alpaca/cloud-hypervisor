@@ -979,6 +979,7 @@ impl Vm {
                 console_info,
                 console_resize_pipe,
                 original_termios,
+                snapshot,
             )?;
         }
 
@@ -1019,6 +1020,7 @@ impl Vm {
                 console_info.cloned(),
                 console_resize_pipe.cloned(),
                 original_termios.clone(),
+                snapshot,
             )?;
         }
 
@@ -1078,10 +1080,11 @@ impl Vm {
         };
 
         // Create interrupt controller and devices for MSHV
+        let dm_snapshot = snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID);
         let ic = device_manager
             .lock()
             .unwrap()
-            .create_interrupt_controller()
+            .create_interrupt_controller(dm_snapshot)
             .map_err(Error::DeviceManager)?;
 
         #[cfg(target_arch = "aarch64")]
@@ -1095,6 +1098,7 @@ impl Vm {
                 console_resize_pipe.cloned(),
                 original_termios.clone(),
                 ic,
+                dm_snapshot,
             )
             .map_err(Error::DeviceManager)?;
 
@@ -1112,11 +1116,13 @@ impl Vm {
         console_info: Option<&ConsoleInfo>,
         console_resize_pipe: Option<&Arc<File>>,
         original_termios: &Arc<Mutex<Option<termios>>>,
+        snapshot: Option<&Snapshot>,
     ) -> Result<()> {
+        let dm_snapshot = snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID);
         let ic = device_manager
             .lock()
             .unwrap()
-            .create_interrupt_controller()
+            .create_interrupt_controller(dm_snapshot)
             .map_err(Error::DeviceManager)?;
 
         #[cfg(target_arch = "aarch64")]
@@ -1130,6 +1136,7 @@ impl Vm {
                 console_resize_pipe.cloned(),
                 original_termios.clone(),
                 ic,
+                dm_snapshot,
             )
             .map_err(Error::DeviceManager)?;
 
@@ -1144,13 +1151,15 @@ impl Vm {
         console_info: Option<ConsoleInfo>,
         console_resize_pipe: Option<Arc<File>>,
         original_termios: Arc<Mutex<Option<termios>>>,
+        snapshot: Option<&Snapshot>,
     ) -> Result<()> {
         // For KVM, create interrupt controller after boot vcpus
         // because GIC state is restored from snapshot during vcpu creation
+        let dm_snapshot = snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID);
         let ic = device_manager
             .lock()
             .unwrap()
-            .create_interrupt_controller()
+            .create_interrupt_controller(dm_snapshot)
             .map_err(Error::DeviceManager)?;
 
         vm.init().map_err(Error::InitializeVm)?;
@@ -1158,7 +1167,13 @@ impl Vm {
         device_manager
             .lock()
             .unwrap()
-            .create_devices(console_info, console_resize_pipe, original_termios, ic)
+            .create_devices(
+                console_info,
+                console_resize_pipe,
+                original_termios,
+                ic,
+                dm_snapshot,
+            )
             .map_err(Error::DeviceManager)?;
 
         Ok(())
