@@ -500,6 +500,7 @@ dependencies = [
  "option_parser",
  "seccompiler",
  "serde_json",
+ "serializable_fd",
  "signal-hook",
  "test_infra",
  "thiserror",
@@ -2265,6 +2266,14 @@ name = "serial_buffer"
 version = "0.1.0"
 
 [[package]]
+name = "serializable_fd"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2850,6 +2859,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_buffer",
+ "serializable_fd",
  "sha2",
  "signal-hook",
  "tempfile",
