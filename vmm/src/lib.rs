@@ -77,6 +77,7 @@ pub mod console_devices;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 mod coredump;
 pub mod cpu;
+mod de_ser;
 pub mod device_manager;
 pub mod device_tree;
 #[cfg(feature = "guest_debug")]
