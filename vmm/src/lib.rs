@@ -4,6 +4,7 @@
 //
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Read, Write, stdout};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -54,6 +55,7 @@ use crate::api::{
 use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
+use crate::de_ser::{Active, Fd, FdMarker, Serialized, StatusMarker};
 use crate::landlock::Landlock;
 use crate::memory_manager::MemoryManager;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -233,8 +235,8 @@ pub enum Error {
     ApplyLandlock(#[source] LandlockError),
 }
 
-impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
-    fn from(_value: &VmConfig) -> Self {
+impl From<&VmConfig<Active>> for hypervisor::HypervisorVmConfig {
+    fn from(_value: &VmConfig<Active>) -> Self {
         hypervisor::HypervisorVmConfig {
             #[cfg(feature = "tdx")]
             tdx_enabled: _value.platform.as_ref().is_some_and(|p| p.tdx),
@@ -593,8 +595,15 @@ where
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct VmMigrationConfig {
-    vm_config: Arc<Mutex<VmConfig>>,
+#[serde(bound(
+    deserialize = "VmConfig<S>: Deserialize<'de>",
+    serialize = "VmConfig<S>: Serialize"
+))]
+struct VmMigrationConfig<S>
+where
+    S: StatusMarker + FdMarker,
+{
+    vm_config: Arc<Mutex<VmConfig<S>>>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     common_cpuid: Vec<hypervisor::arch::x86::CpuIdEntry>,
     memory_manager_data: MemoryManagerSnapshotData,
@@ -634,7 +643,7 @@ pub struct Vmm {
     vm_debug_evt: EventFd,
     version: VmmVersionInfo,
     vm: Option<Vm>,
-    vm_config: Option<Arc<Mutex<VmConfig>>>,
+    vm_config: Option<Arc<Mutex<VmConfig<Active>>>>,
     seccomp_action: SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     activate_evt: EventFd,
@@ -1049,19 +1058,19 @@ impl Vmm {
             .read_exact(&mut data)
             .map_err(MigratableError::MigrateSocket)?;
 
-        let vm_migration_config: VmMigrationConfig =
-            serde_json::from_slice(&data).map_err(|e| {
+        let vm_migration_config: VmMigrationConfig<Serialized> = serde_json::from_slice(&data)
+            .map_err(|e| {
                 MigratableError::MigrateReceive(anyhow!("Error deserialising config: {e}"))
             })?;
 
-        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-        self.vm_check_cpuid_compatibility(
-            &vm_migration_config.vm_config,
-            &vm_migration_config.common_cpuid,
-        )?;
+        let config = Arc::new(Mutex::new(
+            vm_migration_config.vm_config.lock().unwrap().validate(),
+        ));
 
-        let config = vm_migration_config.vm_config.clone();
-        self.vm_config = Some(vm_migration_config.vm_config);
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        self.vm_check_cpuid_compatibility(&config, &vm_migration_config.common_cpuid)?;
+
+        self.vm_config = Some(config.clone());
         self.console_info = Some(pre_create_console_devices(self).map_err(|e| {
             MigratableError::MigrateReceive(anyhow!("Error creating console devices: {e:?}"))
         })?);
@@ -1569,7 +1578,7 @@ impl Vmm {
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     fn vm_check_cpuid_compatibility(
         &self,
-        src_vm_config: &Arc<Mutex<VmConfig>>,
+        src_vm_config: &Arc<Mutex<VmConfig<Active>>>,
         src_vm_cpuid: &[hypervisor::arch::x86::CpuIdEntry],
     ) -> result::Result<(), MigratableError> {
         #[cfg(feature = "tdx")]
@@ -1610,7 +1619,7 @@ impl Vmm {
     fn vm_restore(
         &mut self,
         source_url: &str,
-        vm_config: Arc<Mutex<VmConfig>>,
+        vm_config: Arc<Mutex<VmConfig<Serialized>>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
     ) -> std::result::Result<(), VmError> {

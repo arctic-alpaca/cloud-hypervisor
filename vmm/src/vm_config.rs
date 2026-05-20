@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+use std::fmt::Debug;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "fw_cfg")]
@@ -17,6 +18,7 @@ use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
 
 use crate::Landlock;
+use crate::de_ser::{Active, Fd, FdMarker, Serialized, StatusMarker};
 use crate::landlock::LandlockError;
 
 pub type LandlockResult<T> = result::Result<T, LandlockError>;
@@ -351,7 +353,11 @@ pub fn default_diskconfig_sparse() -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct NetConfig {
+#[serde(bound(deserialize = "Fd<S>: Deserialize<'de>",))]
+pub struct NetConfig<S>
+where
+    S: StatusMarker + FdMarker,
+{
     #[serde(flatten)]
     pub pci_common: PciDeviceCommonConfig,
     #[serde(default = "default_netconfig_tap")]
@@ -373,14 +379,7 @@ pub struct NetConfig {
     pub vhost_socket: Option<String>,
     #[serde(default)]
     pub vhost_mode: VhostMode,
-    // Special deserialize handling:
-    // Therefore, we don't serialize FDs, and whatever value is here after
-    // deserialization is invalid.
-    //
-    // Valid FDs are transmitted via a different channel (SCM_RIGHTS message)
-    // and will be populated into this struct on the destination VMM eventually.
-    #[serde(default, deserialize_with = "deserialize_netconfig_fds")]
-    pub fds: Option<Vec<i32>>,
+    pub fds: Option<Vec<Fd<S>>>,
     #[serde(default)]
     pub rate_limiter_config: Option<RateLimiterConfig>,
     #[serde(default = "default_netconfig_true")]
@@ -1013,8 +1012,12 @@ impl ApplyLandlock for LandlockConfig {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct VmConfig {
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(bound(deserialize = "Fd<S>: Deserialize<'de>",))]
+pub struct VmConfig<S>
+where
+    S: StatusMarker + FdMarker,
+{
     #[serde(default)]
     pub cpus: CpusConfig,
     #[serde(default)]
@@ -1022,7 +1025,7 @@ pub struct VmConfig {
     pub payload: Option<PayloadConfig>,
     pub rate_limit_groups: Option<Box<[RateLimiterGroupConfig]>>,
     pub disks: Option<Vec<DiskConfig>>,
-    pub net: Option<Vec<NetConfig>>,
+    pub net: Option<Vec<NetConfig<S>>>,
     #[serde(default)]
     pub rng: RngConfig,
     pub balloon: Option<BalloonConfig>,
@@ -1065,7 +1068,7 @@ pub struct VmConfig {
     // causes the FDs to be closed early. This allows management software to
     // gracefully clean up resources (e.g., libvirt closes tap devices).
     #[serde(skip)]
-    pub preserved_fds: Option<Vec<i32>>,
+    pub preserved_fds: Option<Vec<Fd<S>>>,
     #[serde(default)]
     pub landlock_enable: bool,
     pub landlock_rules: Option<Box<[LandlockConfig]>>,
@@ -1073,7 +1076,14 @@ pub struct VmConfig {
     pub ivshmem: Option<IvshmemConfig>,
 }
 
-impl VmConfig {
+impl VmConfig<Serialized> {
+    pub fn validate(self) -> VmConfig<Active> {
+        //TODO(de_ser)
+        todo!()
+    }
+}
+
+impl VmConfig<Active> {
     pub(crate) fn apply_landlock(&self) -> LandlockResult<()> {
         let mut landlock = Landlock::new()?;
 

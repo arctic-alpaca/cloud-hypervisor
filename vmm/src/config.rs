@@ -6,6 +6,7 @@
 use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "ivshmem")]
 use std::fs;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::result;
 use std::str::FromStr;
@@ -26,6 +27,7 @@ use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
 
+use crate::de_ser::{Active, Fd};
 use crate::landlock::LandlockAccess;
 use crate::vm_config::*;
 
@@ -801,7 +803,7 @@ impl PciSegmentConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         let num_pci_segments = match &vm_config.platform {
             Some(platform_config) => platform_config.num_pci_segments,
             None => 1,
@@ -1210,7 +1212,7 @@ impl RateLimiterGroupConfig {
         })
     }
 
-    pub fn validate(&self, _vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, _vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.rate_limiter_config.bandwidth.is_none() && self.rate_limiter_config.ops.is_none() {
             return Err(ValidationError::InvalidRateLimiterGroup);
         }
@@ -1258,7 +1260,7 @@ impl PciDeviceCommonConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if let Some(platform_config) = vm_config.platform.as_ref() {
             if self.pci_segment >= platform_config.num_pci_segments {
                 return Err(ValidationError::InvalidPciSegment(self.pci_segment));
@@ -1471,7 +1473,7 @@ impl DiskConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)?;
 
         if self.num_queues > vm_config.cpus.boot_vcpus as usize {
@@ -1532,7 +1534,7 @@ impl FromStr for VhostMode {
     }
 }
 
-impl NetConfig {
+impl NetConfig<Active> {
     pub const SYNTAX: &'static str = "Network parameters \
     \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,fd=<[fd1,fd2,...]>,iommu=on|off,\
     num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,\
@@ -1616,7 +1618,15 @@ impl NetConfig {
         let fds = parser
             .convert::<IntegerList>("fd")
             .map_err(Error::ParseNetwork)?
-            .map(|v| v.0.iter().map(|e| *e as i32).collect());
+            .map(|v| {
+                v.0.iter()
+                    .map(|e| {
+                        // SAFETY: TODO(de_ser)
+                        let fd = unsafe { OwnedFd::from_raw_fd(*e as RawFd) };
+                        Fd::<Active>::new(fd)
+                    })
+                    .collect()
+            });
         let bw_size = parser
             .convert("bw_size")
             .map_err(Error::ParseNetwork)?
@@ -1692,7 +1702,7 @@ impl NetConfig {
         Ok(config)
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)?;
 
         if self.num_queues < 2 {
@@ -1708,9 +1718,9 @@ impl NetConfig {
                 ));
             }
 
-            for &fd in fds {
-                if fd <= 2 {
-                    return Err(ValidationError::VnetReservedFd(fd));
+            for fd in fds {
+                if fd.as_raw_fd() <= 2 {
+                    return Err(ValidationError::VnetReservedFd(fd.as_raw_fd()));
                 }
             }
         }
@@ -1775,7 +1785,7 @@ impl RngConfig {
         Ok(RngConfig { src, pci_common })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)
     }
 }
@@ -1933,7 +1943,7 @@ impl GenericVhostUserConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.pci_common.iommu {
             return Err(ValidationError::IommuNotSupported);
         }
@@ -1984,7 +1994,7 @@ impl FsConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.num_queues > vm_config.cpus.boot_vcpus as usize {
             return Err(ValidationError::TooManyQueues(
                 self.num_queues,
@@ -2135,7 +2145,7 @@ impl PmemConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)
     }
 }
@@ -2196,7 +2206,7 @@ impl ConsoleConfig {
         Ok(Self { common, pci_common })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)
     }
 }
@@ -2305,7 +2315,7 @@ impl DeviceConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)?;
 
         if self.x_nv_gpudirect_clique.is_some() {
@@ -2344,7 +2354,7 @@ impl UserDeviceConfig {
         Ok(UserDeviceConfig { pci_common, socket })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.pci_common.iommu {
             return Err(ValidationError::IommuNotSupported);
         }
@@ -2383,7 +2393,7 @@ impl VdpaConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)
     }
 }
@@ -2418,7 +2428,7 @@ impl VsockConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)
     }
 }
@@ -2682,7 +2692,7 @@ impl RestoreConfig {
     // Ensure all net devices from 'VmConfig' backed by FDs have a
     // corresponding 'RestoreNetConfig' with a matched 'id' and expected
     // number of FDs.
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
         }
@@ -2826,7 +2836,7 @@ impl IvshmemConfig {
     }
 }
 
-impl VmConfig {
+impl VmConfig<Active> {
     fn validate_identifier(
         id_list: &mut BTreeSet<String>,
         id: &Option<String>,
@@ -3278,7 +3288,7 @@ impl VmConfig {
             None
         };
 
-        let mut net: Option<Vec<NetConfig>> = None;
+        let mut net: Option<Vec<NetConfig<Active>>> = None;
         if let Some(net_list) = &vm_params.net {
             let mut net_config_list = Vec::new();
             for item in net_list.iter() {
@@ -3557,10 +3567,7 @@ impl VmConfig {
         removed
     }
 
-    /// # Safety
-    /// To use this safely, the caller must guarantee that the input
-    /// fds are all valid.
-    pub unsafe fn add_preserved_fds(&mut self, mut fds: Vec<i32>) {
+    pub fn add_preserved_fds(&mut self, mut fds: Vec<Fd<Active>>) {
         if fds.is_empty() {
             return;
         }
@@ -3580,58 +3587,6 @@ impl VmConfig {
     #[cfg(feature = "sev_snp")]
     pub fn is_sev_snp_enabled(&self) -> bool {
         self.platform.as_ref().is_some_and(|p| p.sev_snp)
-    }
-}
-
-impl Clone for VmConfig {
-    fn clone(&self) -> Self {
-        VmConfig {
-            cpus: self.cpus.clone(),
-            memory: self.memory.clone(),
-            payload: self.payload.clone(),
-            rate_limit_groups: self.rate_limit_groups.clone(),
-            disks: self.disks.clone(),
-            net: self.net.clone(),
-            rng: self.rng.clone(),
-            balloon: self.balloon.clone(),
-            #[cfg(feature = "pvmemcontrol")]
-            pvmemcontrol: self.pvmemcontrol.clone(),
-            fs: self.fs.clone(),
-            generic_vhost_user: self.generic_vhost_user.clone(),
-            pmem: self.pmem.clone(),
-            serial: self.serial.clone(),
-            console: self.console.clone(),
-            #[cfg(target_arch = "x86_64")]
-            debug_console: self.debug_console.clone(),
-            devices: self.devices.clone(),
-            user_devices: self.user_devices.clone(),
-            vdpa: self.vdpa.clone(),
-            vsock: self.vsock.clone(),
-            numa: self.numa.clone(),
-            pci_segments: self.pci_segments.clone(),
-            platform: self.platform.clone(),
-            tpm: self.tpm.clone(),
-            preserved_fds: self
-                .preserved_fds
-                .as_ref()
-                // SAFETY: FFI call with valid FDs
-                .map(|fds| fds.iter().map(|fd| unsafe { libc::dup(*fd) }).collect()),
-            landlock_rules: self.landlock_rules.clone(),
-            #[cfg(feature = "ivshmem")]
-            ivshmem: self.ivshmem.clone(),
-            ..*self
-        }
-    }
-}
-
-impl Drop for VmConfig {
-    fn drop(&mut self) {
-        if let Some(mut fds) = self.preserved_fds.take() {
-            for fd in fds.drain(..) {
-                // SAFETY: FFI call with valid FDs
-                unsafe { libc::close(fd) };
-            }
-        }
     }
 }
 
@@ -4110,7 +4065,7 @@ mod unit_tests {
         Ok(())
     }
 
-    fn net_fixture() -> NetConfig {
+    fn net_fixture() -> NetConfig<Active> {
         NetConfig {
             pci_common: PciDeviceCommonConfig::default(),
             tap: None,
@@ -5003,7 +4958,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_config_validation() {
-        let mut valid_config = VmConfig {
+        let mut valid_config = VmConfig::<Active> {
             cpus: CpusConfig {
                 boot_vcpus: 1,
                 max_vcpus: 1,
@@ -5943,9 +5898,9 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut still_valid_config = valid_config.clone();
         // SAFETY: Safe as the file was just opened
-        let fd1 = unsafe { libc::dup(File::open("/dev/null").unwrap().as_raw_fd()) };
+        let fd1 = OwnedFd::from(File::open("/dev/null").unwrap()).into();
         // SAFETY: Safe as the file was just opened
-        let fd2 = unsafe { libc::dup(File::open("/dev/null").unwrap().as_raw_fd()) };
+        let fd2 = OwnedFd::from(File::open("/dev/null").unwrap()).into();
         // SAFETY: safe as both FDs are valid
         unsafe {
             still_valid_config.add_preserved_fds(vec![fd1, fd2]);

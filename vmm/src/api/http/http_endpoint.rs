@@ -53,6 +53,7 @@ use crate::api::{
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
+use crate::de_ser::Serialized;
 use crate::vm::Error as VmError;
 
 /// Helper module for attaching externally opened FDs to config objects.
@@ -272,12 +273,13 @@ impl EndpointHandler for VmCreate {
                 match &req.body {
                     Some(body) => {
                         // Deserialize into a VmConfig
-                        let mut vm_config: Box<VmConfig> = match serde_json::from_slice(body.raw())
-                            .map_err(HttpError::SerdeJsonDeserialize)
-                        {
-                            Ok(config) => config,
-                            Err(e) => return error_response(e, StatusCode::BadRequest),
-                        };
+                        let mut vm_config: VmConfig<Serialized> =
+                            match serde_json::from_slice(body.raw())
+                                .map_err(HttpError::SerdeJsonDeserialize)
+                            {
+                                Ok(config) => config,
+                                Err(e) => return error_response(e, StatusCode::BadRequest),
+                            };
 
                         if let Some(ref mut nets) = vm_config.net {
                             let mut cfgs = nets.iter_mut().collect::<Vec<&mut _>>();
@@ -294,6 +296,8 @@ impl EndpointHandler for VmCreate {
                                 }
                             }
                         }
+
+                        let vm_config = Box::new(vm_config.validate());
 
                         match crate::api::VmCreate
                             .send(api_notifier, api_sender, vm_config)

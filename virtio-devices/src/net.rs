@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::Wrapping;
 use std::ops::Deref;
+use std::os::fd::{BorrowedFd, IntoRawFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Barrier};
@@ -582,7 +583,7 @@ impl Net {
     #[allow(clippy::too_many_arguments)]
     pub fn from_tap_fds(
         id: String,
-        fds: &[RawFd],
+        fds: &[BorrowedFd],
         guest_mac: Option<MacAddr>,
         mtu: Option<u16>,
         access_platform_enabled: bool,
@@ -600,11 +601,8 @@ impl Net {
 
         for fd in fds.iter() {
             // Duplicate so that it can survive reboots
-            // SAFETY: FFI call to dup. Trivially safe.
-            let fd = unsafe { libc::dup(*fd) };
-            if fd < 0 {
-                return Err(Error::DuplicateTapFd(std::io::Error::last_os_error()));
-            }
+            let fd = fd.try_clone_to_owned().map_err(Error::DuplicateTapFd)?;
+
             let tap = Tap::from_tap_fd(fd, num_queue_pairs).map_err(Error::TapError)?;
             taps.push(tap);
         }
