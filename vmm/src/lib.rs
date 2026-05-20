@@ -13,6 +13,7 @@ const AUTO_CONVERGE_ITERATION_INCREASE: u64 = 2;
 const AUTO_CONVERGE_MAX: u8 = 99;
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Read, Write, stdout};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -45,6 +46,7 @@ use pci::PciBdf;
 use seccompiler::{SeccompAction, apply_filter};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
+use serializable_fd::{Activatable, Active, FdMarker, Serialized, StatusMarker};
 use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
 use vm_memory::GuestMemoryAtomic;
@@ -66,7 +68,7 @@ use crate::api::{
     ApiRequest, ApiResponse, RequestHandler, TimeoutStrategy, VmInfoResponse,
     VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
 };
-use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
+use crate::config::{MemoryRestoreMode, RestoreConfig, RestoredNetConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
 #[cfg(feature = "kvm")]
@@ -249,8 +251,8 @@ pub enum Error {
     ApplyLandlock(#[source] LandlockError),
 }
 
-impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
-    fn from(_value: &VmConfig) -> Self {
+impl From<&VmConfig<Active>> for hypervisor::HypervisorVmConfig {
+    fn from(_value: &VmConfig<Active>) -> Self {
         hypervisor::HypervisorVmConfig {
             #[cfg(feature = "tdx")]
             tdx_enabled: _value.platform.as_ref().is_some_and(|p| p.tdx),
@@ -614,11 +616,35 @@ where
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct VmMigrationConfig {
-    vm_config: Arc<Mutex<VmConfig>>,
+#[serde(bound(
+    deserialize = "VmConfig<S>: Deserialize<'de>",
+    serialize = "VmConfig<S>: Serialize"
+))]
+struct VmMigrationConfig<S>
+where
+    S: StatusMarker + FdMarker,
+{
+    vm_config: Arc<Mutex<VmConfig<S>>>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     common_cpuid: Vec<hypervisor::arch::x86::CpuIdEntry>,
     memory_manager_data: MemoryManagerSnapshotData,
+}
+
+impl Activatable for VmMigrationConfig<Serialized> {
+    type Activated = VmMigrationConfig<Active>;
+    type Ingest = <VmConfig<Serialized> as Activatable>::Ingest;
+
+    fn activate(
+        self,
+        ingest: &mut Self::Ingest,
+    ) -> result::Result<Self::Activated, serializable_fd::Error> {
+        let active_vm_config = self.vm_config.lock().unwrap().clone().activate(ingest)?;
+        Ok(VmMigrationConfig {
+            vm_config: Arc::new(Mutex::new(active_vm_config)),
+            common_cpuid: self.common_cpuid,
+            memory_manager_data: self.memory_manager_data,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -862,7 +888,7 @@ pub struct Vmm {
     vm_debug_evt: EventFd,
     version: VmmVersionInfo,
     vm: MaybeVmOwnership,
-    vm_config: Option<Arc<Mutex<VmConfig>>>,
+    vm_config: Option<Arc<Mutex<VmConfig<Active>>>>,
     seccomp_action: SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     activate_evt: EventFd,
@@ -1156,7 +1182,7 @@ impl Vmm {
         listener: &ReceiveListener,
         state: ReceiveMigrationState,
         req: &Request,
-        receive_data_migration: &VmReceiveMigrationData,
+        receive_data_migration: &VmReceiveMigrationData<Active>,
     ) -> std::result::Result<ReceiveMigrationState, MigratableError> {
         use ReceiveMigrationState::*;
 
@@ -1176,21 +1202,22 @@ impl Vmm {
                     memory_files,
                     receive_data_migration.tcp_serial_url.clone(),
                     receive_data_migration.zones.clone(),
+                    &receive_data_migration.net_fds,
                 )?;
 
-                if !receive_data_migration.net_fds.is_empty() {
-                    let mut vm_config = self.vm_config.as_mut().unwrap().lock().unwrap();
-                    for restored_net in &receive_data_migration.net_fds {
-                        for net_config in vm_config.net.iter_mut().flatten() {
-                            // Only update net devices that are backed directly by file descriptors.
-                            if net_config.pci_common.id.as_ref() == Some(&restored_net.id)
-                                && net_config.fds.is_some()
-                            {
-                                net_config.fds.clone_from(&restored_net.fds);
-                            }
-                        }
-                    }
-                }
+                // if !receive_data_migration.net_fds.is_empty() {
+                //     let mut vm_config = self.vm_config.as_mut().unwrap().lock().unwrap();
+                //     for restored_net in &receive_data_migration.net_fds {
+                //         for net_config in vm_config.net.iter_mut().flatten() {
+                //             // Only update net devices that are backed directly by file descriptors.
+                //             if net_config.pci_common.id.as_ref() == Some(&restored_net.id)
+                //                 && net_config.fds.is_some()
+                //             {
+                //                 net_config.fds.clone_from(&restored_net.fds);
+                //             }
+                //         }
+                //     }
+                // }
 
                 let guest_memory = memory_manager.lock().unwrap().guest_memory();
                 // Create the additional-connection receiver even in the single-connection case.
@@ -1349,6 +1376,7 @@ impl Vmm {
         existing_memory_files: HashMap<u32, File>,
         tcp_serial_url: Option<String>,
         zones: Vec<MemoryZoneConfig>,
+        restored_net_configs: &[RestoredNetConfig<Active>],
     ) -> std::result::Result<Arc<Mutex<MemoryManager>>, MigratableError>
     where
         T: Read,
@@ -1360,18 +1388,26 @@ impl Vmm {
             .read_exact(&mut data)
             .map_err(MigratableError::MigrateSocket)?;
 
-        let vm_migration_config: VmMigrationConfig = serde_json::from_slice(&data)
+        let vm_migration_config: VmMigrationConfig<Serialized> = serde_json::from_slice(&data)
             .context("Error deserialising config")
             .map_err(MigratableError::MigrateReceive)?;
 
-        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-        self.vm_check_cpuid_compatibility(
-            &vm_migration_config.vm_config,
-            &vm_migration_config.common_cpuid,
-        )?;
+        let mut fd_map =
+            restored_net_configs
+                .iter()
+                .fold(HashMap::new(), |mut fd_map, restored_net_config| {
+                    restored_net_config.fd_map(&mut fd_map);
+                    fd_map
+                });
 
-        let config = vm_migration_config.vm_config.clone();
-        self.vm_config = Some(vm_migration_config.vm_config);
+        let vm_migration_config = vm_migration_config.activate(&mut fd_map).unwrap();
+
+        let config = vm_migration_config.vm_config;
+
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        self.vm_check_cpuid_compatibility(&config, &vm_migration_config.common_cpuid)?;
+
+        self.vm_config = Some(config.clone());
 
         if let Some(tcp_serial_url) = tcp_serial_url {
             let mut vm_config = self.vm_config.as_mut().unwrap().lock().unwrap();
@@ -2077,7 +2113,7 @@ impl Vmm {
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     fn vm_check_cpuid_compatibility(
         &self,
-        src_vm_config: &Arc<Mutex<VmConfig>>,
+        src_vm_config: &Arc<Mutex<VmConfig<Active>>>,
         src_vm_cpuid: &[hypervisor::arch::x86::CpuIdEntry],
     ) -> result::Result<(), MigratableError> {
         #[cfg(feature = "tdx")]
@@ -2125,7 +2161,7 @@ impl Vmm {
     fn vm_restore(
         &mut self,
         source_url: &str,
-        vm_config: Arc<Mutex<VmConfig>>,
+        vm_config: Arc<Mutex<VmConfig<Active>>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
     ) -> std::result::Result<(), VmError> {
@@ -2494,13 +2530,13 @@ impl Vmm {
     }
 }
 
-fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError> {
+fn apply_landlock(vm_config: &mut VmConfig<Active>) -> result::Result<(), LandlockError> {
     vm_config.apply_landlock()?;
     Ok(())
 }
 
 impl RequestHandler for Vmm {
-    fn vm_create(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
+    fn vm_create(&mut self, config: Box<VmConfig<Active>>) -> result::Result<(), VmError> {
         // We only store the passed VM config.
         // The VM will be created when being asked to boot it.
         if self.vm_config.is_some() {
@@ -2637,7 +2673,7 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
+    fn vm_restore(&mut self, restore_cfg: RestoreConfig<Active>) -> result::Result<(), VmError> {
         match &self.vm {
             MaybeVmOwnership::Vmm(_vm) => return Err(VmError::VmAlreadyCreated),
             MaybeVmOwnership::Migration(_) => return Err(VmError::VmMigrating),
@@ -2655,8 +2691,13 @@ impl RequestHandler for Vmm {
         // Safe to unwrap as we checked it was Some(&str).
         let source_url = source_url.unwrap();
 
+        let mut fd_map = restore_cfg.fd_map();
+
         let vm_config = Arc::new(Mutex::new(
-            recv_vm_config(source_url).map_err(VmError::Restore)?,
+            recv_vm_config(source_url)
+                .map_err(VmError::Restore)?
+                .activate(&mut fd_map)
+                .unwrap(),
         ));
         restore_cfg
             .validate(&vm_config.lock().unwrap().clone())
@@ -3151,7 +3192,10 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_add_net(&mut self, net_cfg: NetConfig) -> result::Result<Option<Vec<u8>>, VmError> {
+    fn vm_add_net(
+        &mut self,
+        net_cfg: NetConfig<Active>,
+    ) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
         {
@@ -3276,7 +3320,7 @@ impl RequestHandler for Vmm {
 
     fn vm_receive_migration(
         &mut self,
-        receive_data_migration: VmReceiveMigrationData,
+        receive_data_migration: VmReceiveMigrationData<Active>,
     ) -> result::Result<(), MigratableError> {
         receive_data_migration
             .validate()
@@ -3542,7 +3586,7 @@ mod unit_tests {
         .unwrap()
     }
 
-    fn create_dummy_vm_config() -> Box<VmConfig> {
+    fn create_dummy_vm_config() -> Box<VmConfig<Active>> {
         Box::new(VmConfig {
             cpus: CpusConfig {
                 boot_vcpus: 1,

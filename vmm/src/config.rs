@@ -6,6 +6,8 @@
 use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "ivshmem")]
 use std::fs;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::result;
 use std::str::FromStr;
@@ -14,12 +16,15 @@ use std::sync::LazyLock;
 use arch::CpuProfile;
 use block::ImageType;
 use clap::ArgMatches;
-use log::{debug, warn};
+use log::warn;
 use option_parser::{
     ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple,
 };
 use pci::NUM_DEVICE_IDS;
 use serde::{Deserialize, Serialize};
+use serializable_fd::{
+    Activatable, Active, Fd, FdDevice, FdMarker, Serializable, Serialized, StatusMarker,
+};
 use thiserror::Error;
 use virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
 use virtio_bindings::virtio_ids::*;
@@ -813,7 +818,7 @@ impl PciSegmentConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         let num_pci_segments = match &vm_config.platform {
             Some(platform_config) => platform_config.num_pci_segments,
             None => 1,
@@ -1323,7 +1328,7 @@ impl RateLimiterGroupConfig {
         })
     }
 
-    pub fn validate(&self, _vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, _vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.rate_limiter_config.bandwidth.is_none() && self.rate_limiter_config.ops.is_none() {
             return Err(ValidationError::InvalidRateLimiterGroup);
         }
@@ -1371,7 +1376,7 @@ impl PciDeviceCommonConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if let Some(platform_config) = vm_config.platform.as_ref() {
             if self.pci_segment >= platform_config.num_pci_segments {
                 return Err(ValidationError::InvalidPciSegment(self.pci_segment));
@@ -1584,7 +1589,7 @@ impl DiskConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)?;
 
         if self.num_queues > vm_config.cpus.boot_vcpus as usize {
@@ -1645,7 +1650,7 @@ impl FromStr for VhostMode {
     }
 }
 
-impl NetConfig {
+impl NetConfig<Active> {
     pub const SYNTAX: &'static str = "Network parameters \
     \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,fd=<[fd1,fd2,...]>,iommu=on|off,\
     num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,\
@@ -1729,7 +1734,15 @@ impl NetConfig {
         let fds = parser
             .convert::<IntegerList>("fd")
             .map_err(Error::ParseNetwork)?
-            .map(|v| v.0.iter().map(|e| *e as i32).collect());
+            .map(|v| {
+                v.0.iter()
+                    .map(|e| {
+                        // SAFETY: TODO(de_ser)
+                        let fd = unsafe { OwnedFd::from_raw_fd(*e as RawFd) };
+                        Fd::<Active>::new(fd)
+                    })
+                    .collect()
+            });
         let bw_size = parser
             .convert("bw_size")
             .map_err(Error::ParseNetwork)?
@@ -1805,7 +1818,7 @@ impl NetConfig {
         Ok(config)
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)?;
 
         if self.num_queues < 2 {
@@ -1821,9 +1834,9 @@ impl NetConfig {
                 ));
             }
 
-            for &fd in fds {
-                if fd <= 2 {
-                    return Err(ValidationError::VnetReservedFd(fd));
+            for fd in fds {
+                if fd.as_raw_fd() <= 2 {
+                    return Err(ValidationError::VnetReservedFd(fd.as_raw_fd()));
                 }
             }
         }
@@ -1888,7 +1901,7 @@ impl RngConfig {
         Ok(RngConfig { src, pci_common })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)
     }
 }
@@ -2046,7 +2059,7 @@ impl GenericVhostUserConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.pci_common.iommu {
             return Err(ValidationError::IommuNotSupported);
         }
@@ -2097,7 +2110,7 @@ impl FsConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.num_queues > vm_config.cpus.boot_vcpus as usize {
             return Err(ValidationError::TooManyQueues(
                 self.num_queues,
@@ -2248,7 +2261,7 @@ impl PmemConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)
     }
 }
@@ -2328,7 +2341,7 @@ impl ConsoleConfig {
         Ok(Self { common, pci_common })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)
     }
 }
@@ -2437,7 +2450,7 @@ impl DeviceConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)?;
 
         if self.x_nv_gpudirect_clique.is_some() {
@@ -2476,7 +2489,7 @@ impl UserDeviceConfig {
         Ok(UserDeviceConfig { pci_common, socket })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.pci_common.iommu {
             return Err(ValidationError::IommuNotSupported);
         }
@@ -2515,7 +2528,7 @@ impl VdpaConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)
     }
 }
@@ -2550,7 +2563,7 @@ impl VsockConfig {
         })
     }
 
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)
     }
 }
@@ -2675,26 +2688,54 @@ impl NumaConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub struct RestoredNetConfig {
+#[serde(bound(deserialize = "Fd<S>: Deserialize<'de>",))]
+pub struct RestoredNetConfig<S>
+where
+    S: StatusMarker + FdMarker,
+{
     pub id: String,
     #[serde(default)]
     pub num_fds: usize,
-    // Special deserialize handling:
-    // A serialize-deserialize cycle typically happens across processes.
-    // Therefore, we don't serialize FDs, and whatever value is here after
-    // deserialization is invalid.
-    //
-    // Valid FDs are transmitted via a different channel (SCM_RIGHTS message)
-    // and will be populated into this struct on the destination VMM eventually.
-    #[serde(default, deserialize_with = "deserialize_restorednetconfig_fds")]
-    pub fds: Option<Vec<i32>>,
+    pub fds: Option<Vec<Fd<S>>>,
 }
 
-impl RestoredNetConfig {
+impl Serializable for RestoredNetConfig<Active> {
+    fn fd_list(&self, fds: &mut Vec<Fd<Active>>) {
+        if let Some(self_fds) = &self.fds {
+            fds.clone_from_slice(self_fds);
+        }
+    }
+}
+
+impl Activatable for RestoredNetConfig<Serialized> {
+    type Activated = RestoredNetConfig<Active>;
+    type Ingest = Vec<File>;
+
+    fn activate(
+        self,
+        ingest: &mut Self::Ingest,
+    ) -> result::Result<Self::Activated, serializable_fd::Error> {
+        if ingest.len() < self.num_fds {
+            return Err(serializable_fd::Error::Todo);
+        }
+        let fds: Vec<Fd<Active>> = ingest
+            .drain(..self.num_fds)
+            .map(|file| OwnedFd::from(file).into())
+            .collect();
+
+        let fds = if fds.is_empty() { None } else { Some(fds) };
+        Ok(RestoredNetConfig {
+            id: self.id,
+            num_fds: self.num_fds,
+            fds,
+        })
+    }
+}
+impl RestoredNetConfig<Active> {
     // Ensure all net devices from 'VmConfig' backed by FDs have a
     // corresponding 'RestoreNetConfig' with a matched 'id' and expected
     // number of FDs.
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         let found = vm_config
             .net
             .iter()
@@ -2709,25 +2750,13 @@ impl RestoredNetConfig {
             ))
         }
     }
-}
 
-fn deserialize_restorednetconfig_fds<'de, D>(
-    d: D,
-) -> std::result::Result<Option<Vec<i32>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fds: Option<Vec<i32>> = Option::deserialize(d)?;
-    if let Some(invalid_fds) = invalid_fds {
-        // If the live-migration path is used properly, new FDs are passed as
-        // SCM_RIGHTS message. So, we don't get them from the serialized JSON
-        // anyway.
-        debug!(
-            "FDs in 'RestoredNetConfig' won't be deserialized as they are most likely invalid now. Deserializing them as -1."
-        );
-        Ok(Some(vec![-1; invalid_fds.len()]))
-    } else {
-        Ok(None)
+    pub fn fd_map(&self, fd_map: &mut HashMap<FdDevice, Vec<Fd<Active>>>) {
+        let Some(fds) = self.fds.clone() else {
+            return;
+        };
+        let fd_device = FdDevice::new_net(self.id.clone());
+        fd_map.insert(fd_device, fds);
     }
 }
 
@@ -2759,19 +2788,56 @@ impl FromStr for MemoryRestoreMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub struct RestoreConfig {
+#[serde(bound(deserialize = "serializable_fd::Fd<S>: Deserialize<'de>",))]
+pub struct RestoreConfig<S>
+where
+    S: StatusMarker + FdMarker,
+{
     pub source_url: PathBuf,
     #[serde(default)]
     pub prefault: bool,
     #[serde(default)]
     pub memory_restore_mode: MemoryRestoreMode,
     #[serde(default)]
-    pub net_fds: Option<Vec<RestoredNetConfig>>,
+    pub net_fds: Option<Vec<RestoredNetConfig<S>>>,
     #[serde(default)]
     pub resume: bool,
 }
 
-impl RestoreConfig {
+impl Serializable for RestoreConfig<Active> {
+    fn fd_list(&self, fds: &mut Vec<Fd<Active>>) {
+        self.net_fds.as_ref().map(|restored_net_configs| {
+            restored_net_configs
+                .iter()
+                .map(|restored_net_config| restored_net_config.fd_list(fds))
+        });
+    }
+}
+
+impl Activatable for RestoreConfig<Serialized> {
+    type Activated = RestoreConfig<Active>;
+    type Ingest = <RestoredNetConfig<Serialized> as Activatable>::Ingest;
+
+    fn activate(
+        self,
+        ingest: &mut Self::Ingest,
+    ) -> std::result::Result<Self::Activated, serializable_fd::Error> {
+        Ok(RestoreConfig {
+            source_url: self.source_url,
+            prefault: self.prefault,
+            memory_restore_mode: self.memory_restore_mode,
+            net_fds: self.net_fds.map(|net_fds| {
+                net_fds
+                    .into_iter()
+                    .map(|restored_net_config| restored_net_config.activate(ingest).unwrap())
+                    .collect()
+            }),
+            resume: self.resume,
+        })
+    }
+}
+
+impl RestoreConfig<Active> {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false\" \
@@ -2813,7 +2879,15 @@ impl RestoreConfig {
                     .map(|(id, fds)| RestoredNetConfig {
                         id: id.clone(),
                         num_fds: fds.len(),
-                        fds: Some(fds.iter().map(|e| *e as i32).collect()),
+                        fds: Some(
+                            fds.iter()
+                                .map(|e| {
+                                    // SAFETY: TODO(de_ser)
+                                    let fd = unsafe { OwnedFd::from_raw_fd(*e as RawFd) };
+                                    Fd::<Active>::new(fd)
+                                })
+                                .collect(),
+                        ),
                     })
                     .collect()
             });
@@ -2832,10 +2906,21 @@ impl RestoreConfig {
         })
     }
 
+    pub fn fd_map(&self) -> HashMap<FdDevice, Vec<Fd<Active>>> {
+        let mut result = HashMap::new();
+        let Some(net_fds) = self.net_fds.clone() else {
+            return result;
+        };
+        net_fds.iter().for_each(|restored_net_config| {
+            restored_net_config.fd_map(&mut result);
+        });
+        result
+    }
+
     // Ensure all net devices from 'VmConfig' backed by FDs have a
     // corresponding 'RestoreNetConfig' with a matched 'id' and expected
     // number of FDs.
-    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+    pub fn validate(&self, _vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
         }
@@ -2852,28 +2937,28 @@ impl RestoreConfig {
             }
         }
 
-        for net_fds in vm_config.net.iter().flatten() {
-            if let Some(expected_fds) = &net_fds.fds {
-                let expected_id = net_fds
-                    .pci_common
-                    .id
-                    .as_ref()
-                    .expect("Invalid 'NetConfig' with empty 'id' for VM restore.");
-                if let Some(r) = restored_net_with_fds.remove(expected_id) {
-                    if r.num_fds != expected_fds.len() {
-                        return Err(ValidationError::RestoreNetFdCountMismatch(
-                            expected_id.clone(),
-                            r.num_fds,
-                            expected_fds.len(),
-                        ));
-                    }
-                } else {
-                    return Err(ValidationError::RestoreMissingRequiredNetId(
-                        expected_id.clone(),
-                    ));
-                }
-            }
-        }
+        // for net_fds in vm_config.net.iter().flatten() {
+        //     if let Some(expected_fds) = &net_fds.fds {
+        //         let expected_id = net_fds
+        //             .pci_common
+        //             .id
+        //             .as_ref()
+        //             .expect("Invalid 'NetConfig' with empty 'id' for VM restore.");
+        //         if let Some(r) = restored_net_with_fds.remove(expected_id) {
+        //             if r.num_fds != expected_fds.len() {
+        //                 return Err(ValidationError::RestoreNetFdCountMismatch(
+        //                     expected_id.clone(),
+        //                     r.num_fds,
+        //                     expected_fds.len(),
+        //                 ));
+        //             }
+        //         } else {
+        //             return Err(ValidationError::RestoreMissingRequiredNetId(
+        //                 expected_id.clone(),
+        //             ));
+        //         }
+        //     }
+        // }
 
         if !restored_net_with_fds.is_empty() {
             warn!("Ignoring unused 'net_fds' for VM restore.");
@@ -2979,7 +3064,7 @@ impl IvshmemConfig {
     }
 }
 
-impl VmConfig {
+impl VmConfig<Active> {
     fn validate_identifier(
         id_list: &mut BTreeSet<String>,
         id: &Option<String>,
@@ -3431,7 +3516,7 @@ impl VmConfig {
             None
         };
 
-        let mut net: Option<Vec<NetConfig>> = None;
+        let mut net: Option<Vec<NetConfig<Active>>> = None;
         if let Some(net_list) = &vm_params.net {
             let mut net_config_list = Vec::new();
             for item in net_list.iter() {
@@ -3709,12 +3794,7 @@ impl VmConfig {
         removed
     }
 
-    /// # Safety
-    /// To use this safely, the caller must guarantee that the input
-    /// fds are all valid.
-    pub unsafe fn add_preserved_fds(&mut self, mut fds: Vec<i32>) {
-        debug!("adding preserved FDs to VM list: {fds:?}");
-
+    pub fn add_preserved_fds(&mut self, mut fds: Vec<Fd<Active>>) {
         if fds.is_empty() {
             return;
         }
@@ -3734,68 +3814,6 @@ impl VmConfig {
     #[cfg(feature = "sev_snp")]
     pub fn is_sev_snp_enabled(&self) -> bool {
         self.platform.as_ref().is_some_and(|p| p.sev_snp)
-    }
-}
-
-impl Clone for VmConfig {
-    fn clone(&self) -> Self {
-        VmConfig {
-            cpus: self.cpus.clone(),
-            memory: self.memory.clone(),
-            payload: self.payload.clone(),
-            rate_limit_groups: self.rate_limit_groups.clone(),
-            disks: self.disks.clone(),
-            net: self.net.clone(),
-            rng: self.rng.clone(),
-            balloon: self.balloon.clone(),
-            #[cfg(feature = "pvmemcontrol")]
-            pvmemcontrol: self.pvmemcontrol.clone(),
-            fs: self.fs.clone(),
-            generic_vhost_user: self.generic_vhost_user.clone(),
-            pmem: self.pmem.clone(),
-            serial: self.serial.clone(),
-            console: self.console.clone(),
-            #[cfg(target_arch = "x86_64")]
-            debug_console: self.debug_console.clone(),
-            devices: self.devices.clone(),
-            user_devices: self.user_devices.clone(),
-            vdpa: self.vdpa.clone(),
-            vsock: self.vsock.clone(),
-            numa: self.numa.clone(),
-            pci_segments: self.pci_segments.clone(),
-            platform: self.platform.clone(),
-            tpm: self.tpm.clone(),
-            preserved_fds: self
-                .preserved_fds
-                .as_ref()
-                // SAFETY: FFI call with valid FDs
-                .map(|fds| {
-                    fds.iter()
-                        .map(|fd| {
-                            // SAFETY: Trivially safe.
-                            let fd_duped = unsafe { libc::dup(*fd) };
-                            warn!("Cloning VM config: duping preserved FD {fd} => {fd_duped}");
-                            fd_duped
-                        })
-                        .collect()
-                }),
-            landlock_rules: self.landlock_rules.clone(),
-            #[cfg(feature = "ivshmem")]
-            ivshmem: self.ivshmem.clone(),
-            ..*self
-        }
-    }
-}
-
-impl Drop for VmConfig {
-    fn drop(&mut self) {
-        if let Some(mut fds) = self.preserved_fds.take() {
-            debug!("Closing preserved FDs from VM: fds={fds:?}");
-            for fd in fds.drain(..) {
-                // SAFETY: FFI call with valid FDs
-                unsafe { libc::close(fd) };
-            }
-        }
     }
 }
 

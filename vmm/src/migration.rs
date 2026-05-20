@@ -7,6 +7,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
+use serializable_fd::Serialized;
 use vm_migration::{MigratableError, Snapshot};
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -46,7 +47,9 @@ pub fn url_to_file(url: &str) -> std::result::Result<PathBuf, GuestDebuggableErr
     Ok(file)
 }
 
-pub fn recv_vm_config(source_url: &str) -> std::result::Result<VmConfig, MigratableError> {
+pub fn recv_vm_config(
+    source_url: &str,
+) -> std::result::Result<VmConfig<Serialized>, MigratableError> {
     let mut vm_config_path = url_to_path(source_url)?;
 
     vm_config_path.push(SNAPSHOT_CONFIG_FILE);

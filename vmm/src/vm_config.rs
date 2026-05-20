@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+use std::collections::HashMap;
+use std::fmt::Debug;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "fw_cfg")]
@@ -11,9 +13,12 @@ use std::{fs, result};
 use arch::CpuProfile;
 use block::ImageType;
 pub use block::fcntl::LockGranularityChoice;
-use log::{debug, warn};
+use log::warn;
 use net_util::MacAddr;
 use serde::{Deserialize, Serialize};
+use serializable_fd::{
+    Activatable, Active, Error, Fd, FdDevice, FdMarker, Serializable, Serialized, StatusMarker,
+};
 use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
 
@@ -414,7 +419,11 @@ pub fn default_diskconfig_sparse() -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct NetConfig {
+#[serde(bound(deserialize = "Fd<S>: Deserialize<'de>",))]
+pub struct NetConfig<S>
+where
+    S: StatusMarker + FdMarker,
+{
     #[serde(flatten)]
     pub pci_common: PciDeviceCommonConfig,
     #[serde(default = "default_netconfig_tap")]
@@ -436,14 +445,7 @@ pub struct NetConfig {
     pub vhost_socket: Option<String>,
     #[serde(default)]
     pub vhost_mode: VhostMode,
-    // Special deserialize handling:
-    // Therefore, we don't serialize FDs, and whatever value is here after
-    // deserialization is invalid.
-    //
-    // Valid FDs are transmitted via a different channel (SCM_RIGHTS message)
-    // and will be populated into this struct on the destination VMM eventually.
-    #[serde(default, deserialize_with = "deserialize_netconfig_fds")]
-    pub fds: Option<Vec<i32>>,
+    pub fds: Option<Vec<Fd<S>>>,
     #[serde(default)]
     pub rate_limiter_config: Option<RateLimiterConfig>,
     #[serde(default = "default_netconfig_true")]
@@ -452,6 +454,66 @@ pub struct NetConfig {
     pub offload_ufo: bool,
     #[serde(default = "default_netconfig_true")]
     pub offload_csum: bool,
+}
+
+impl Serializable for NetConfig<Active> {
+    fn fd_list(&self, fds: &mut Vec<Fd<Active>>) {
+        if let Some(self_fds) = &self.fds {
+            fds.clone_from_slice(self_fds);
+        }
+    }
+}
+
+impl Activatable for NetConfig<Serialized> {
+    type Activated = NetConfig<Active>;
+    type Ingest = HashMap<FdDevice, Vec<Fd<Active>>>;
+
+    fn activate(self, ingest: &mut Self::Ingest) -> Result<Self::Activated, Error> {
+        fn activated(
+            net_config: NetConfig<Serialized>,
+            fds: Option<Vec<Fd<Active>>>,
+        ) -> NetConfig<Active> {
+            NetConfig {
+                pci_common: net_config.pci_common,
+                tap: net_config.tap,
+                ip: net_config.ip,
+                mask: net_config.mask,
+                mac: net_config.mac,
+                host_mac: net_config.host_mac,
+                mtu: net_config.mtu,
+                num_queues: net_config.num_queues,
+                queue_size: net_config.queue_size,
+                vhost_user: net_config.vhost_user,
+                vhost_socket: net_config.vhost_socket,
+                vhost_mode: net_config.vhost_mode,
+                fds,
+                rate_limiter_config: net_config.rate_limiter_config,
+                offload_tso: net_config.offload_tso,
+                offload_ufo: net_config.offload_ufo,
+                offload_csum: net_config.offload_csum,
+            }
+        }
+
+        let Some(id) = &self.pci_common.id else {
+            return if self.fds.is_some() {
+                Err(Error::Todo)
+            } else {
+                Ok(activated(self, None))
+            };
+        };
+
+        let device = FdDevice::new_net(id.clone());
+        match ingest.remove(&device) {
+            Some(fds) => Ok(activated(self, Some(fds))),
+            None => {
+                if self.fds.is_some() {
+                    Err(Error::Todo)
+                } else {
+                    Ok(activated(self, None))
+                }
+            }
+        }
+    }
 }
 
 pub fn default_netconfig_true() -> bool {
@@ -476,21 +538,6 @@ pub const DEFAULT_NET_QUEUE_SIZE: u16 = 256;
 
 pub fn default_netconfig_queue_size() -> u16 {
     DEFAULT_NET_QUEUE_SIZE
-}
-
-fn deserialize_netconfig_fds<'de, D>(d: D) -> Result<Option<Vec<i32>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fds: Option<Vec<i32>> = Option::deserialize(d)?;
-    if let Some(invalid_fds) = invalid_fds {
-        debug!(
-            "FDs in 'NetConfig' won't be deserialized as they are most likely invalid now. Deserializing them as -1."
-        );
-        Ok(Some(vec![-1; invalid_fds.len()]))
-    } else {
-        Ok(None)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -1081,8 +1128,12 @@ impl ApplyLandlock for LandlockConfig {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct VmConfig {
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(bound(deserialize = "Fd<S>: Deserialize<'de>",))]
+pub struct VmConfig<S>
+where
+    S: StatusMarker + FdMarker,
+{
     #[serde(default)]
     pub cpus: CpusConfig,
     #[serde(default)]
@@ -1090,7 +1141,7 @@ pub struct VmConfig {
     pub payload: Option<PayloadConfig>,
     pub rate_limit_groups: Option<Vec<RateLimiterGroupConfig>>,
     pub disks: Option<Vec<DiskConfig>>,
-    pub net: Option<Vec<NetConfig>>,
+    pub net: Option<Vec<NetConfig<S>>>,
     #[serde(default)]
     pub rng: RngConfig,
     pub balloon: Option<BalloonConfig>,
@@ -1133,7 +1184,7 @@ pub struct VmConfig {
     // causes the FDs to be closed early. This allows management software to
     // gracefully clean up resources (e.g., libvirt closes tap devices).
     #[serde(skip)]
-    pub preserved_fds: Option<Vec<i32>>,
+    pub preserved_fds: Option<Vec<Fd<S>>>,
     #[serde(default)]
     pub landlock_enable: bool,
     pub landlock_rules: Option<Vec<LandlockConfig>>,
@@ -1141,7 +1192,50 @@ pub struct VmConfig {
     pub ivshmem: Option<IvshmemConfig>,
 }
 
-impl VmConfig {
+impl Activatable for VmConfig<Serialized> {
+    type Activated = VmConfig<Active>;
+    type Ingest = <NetConfig<Serialized> as Activatable>::Ingest;
+
+    fn activate(self, ingest: &mut Self::Ingest) -> Result<Self::Activated, Error> {
+        Ok(VmConfig {
+            cpus: self.cpus,
+            memory: self.memory,
+            payload: self.payload,
+            rate_limit_groups: self.rate_limit_groups,
+            disks: self.disks,
+            net: self.net.map(|nets| {
+                nets.into_iter()
+                    .map(|net| net.activate(ingest).unwrap())
+                    .collect()
+            }),
+            rng: self.rng,
+            balloon: self.balloon,
+            generic_vhost_user: self.generic_vhost_user,
+            fs: self.fs,
+            pmem: self.pmem,
+            serial: self.serial,
+            console: self.console,
+            debug_console: self.debug_console,
+            devices: self.devices,
+            user_devices: self.user_devices,
+            vdpa: self.vdpa,
+            vsock: self.vsock,
+            pvpanic: self.pvpanic,
+            iommu: self.iommu,
+            numa: self.numa,
+            watchdog: self.watchdog,
+            pci_segments: self.pci_segments,
+            platform: self.platform,
+            tpm: self.tpm,
+            //TODO(de_ser): can we fix this?
+            preserved_fds: None,
+            landlock_enable: false,
+            landlock_rules: None,
+        })
+    }
+}
+
+impl VmConfig<Active> {
     pub(crate) fn apply_landlock(&self) -> LandlockResult<()> {
         let mut landlock = Landlock::new()?;
 

@@ -4,8 +4,9 @@
 //
 
 use std::io::{Read, Write};
-use std::os::unix::io::RawFd;
+use std::os::fd::AsRawFd;
 
+use serializable_fd::{Active, Fd};
 use thiserror::Error;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -142,7 +143,7 @@ pub fn simple_api_full_command_with_fds_and_response<T: Read + Write + ScmSocket
     method: &str,
     full_command: &str,
     request_body: Option<&str>,
-    request_fds: &[RawFd],
+    request_fds: &[Fd<Active>],
 ) -> Result<Option<String>, Error> {
     socket
         .send_with_fds(
@@ -150,7 +151,10 @@ pub fn simple_api_full_command_with_fds_and_response<T: Read + Write + ScmSocket
                 "{method} /api/v1/{full_command} HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n"
             )
             .as_bytes()],
-            request_fds,
+            &request_fds
+                .iter()
+                .map(|fd| fd.as_raw_fd())
+                .collect::<Vec<_>>(),
         )
         .map_err(Error::SocketSendFds)?;
 
@@ -178,7 +182,7 @@ pub fn simple_api_full_command_with_fds<T: Read + Write + ScmSocket>(
     method: &str,
     full_command: &str,
     request_body: Option<&str>,
-    request_fds: &[RawFd],
+    request_fds: &[Fd<Active>],
 ) -> Result<(), Error> {
     let response = simple_api_full_command_with_fds_and_response(
         socket,
@@ -218,7 +222,7 @@ pub fn simple_api_command_with_fds<T: Read + Write + ScmSocket>(
     method: &str,
     c: &str,
     request_body: Option<&str>,
-    request_fds: &[RawFd],
+    request_fds: &[Fd<Active>],
 ) -> Result<(), Error> {
     // Create the full VM command. For VMM commands, use
     // simple_api_full_command().

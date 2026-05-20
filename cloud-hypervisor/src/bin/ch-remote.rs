@@ -23,6 +23,7 @@ use clap::ArgAction;
 use clap::{Arg, ArgMatches, Command};
 use log::{error, info};
 use option_parser::{ByteSized, ByteSizedParseError};
+use serializable_fd::{Active, Fd, Serializable};
 use thiserror::Error;
 use vm_migration::progress::{MigrationProgress, MigrationState};
 use vmm::config::RestoreConfig;
@@ -968,14 +969,16 @@ fn add_pmem_config(config: &str) -> Result<String, Error> {
     Ok(pmem_config)
 }
 
-fn add_net_config(config: &str) -> Result<(String, Vec<i32>), Error> {
-    let mut net_config = NetConfig::parse(config).map_err(Error::AddNetConfig)?;
+fn add_net_config(config: &str) -> Result<(String, Vec<Fd<Active>>), Error> {
+    let net_config = NetConfig::parse(config).map_err(Error::AddNetConfig)?;
 
     // NetConfig is modified on purpose here by taking the list of file
     // descriptors out. Keeping the list and send it to the server side
     // process would not make any sense since the file descriptor may be
     // represented with different values.
-    let fds = net_config.fds.take().unwrap_or_default();
+
+    let mut fds = Vec::new();
+    net_config.fd_list(&mut fds);
     let net_config = serde_json::to_string(&net_config).unwrap();
 
     Ok((net_config, fds))
@@ -1003,17 +1006,12 @@ fn snapshot_config(url: &str) -> String {
     serde_json::to_string(&snapshot_config).unwrap()
 }
 
-fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
-    let mut restore_config = RestoreConfig::parse(config).map_err(Error::Restore)?;
+fn restore_config(config: &str) -> Result<(String, Vec<Fd<Active>>), Error> {
+    let restore_config = RestoreConfig::parse(config).map_err(Error::Restore)?;
     // RestoreConfig is modified on purpose to take out the file descriptors.
     // These fds are passed to the server side process via SCM_RIGHTS
-    let fds = match &mut restore_config.net_fds {
-        Some(net_fds) => net_fds
-            .iter_mut()
-            .flat_map(|net| net.fds.take().unwrap_or_default())
-            .collect(),
-        None => Vec::new(),
-    };
+    let mut fds = Vec::new();
+    restore_config.fd_list(&mut fds);
     let restore_config = serde_json::to_string(&restore_config).unwrap();
 
     Ok((restore_config, fds))

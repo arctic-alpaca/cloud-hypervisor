@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Seek, SeekFrom, stdout};
 use std::num::Wrapping;
+use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(not(target_arch = "riscv64"))]
@@ -81,6 +82,7 @@ use pci::{
 use rate_limiter::group::RateLimiterGroup;
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
+use serializable_fd::Active;
 use thiserror::Error;
 use tracer::trace_scoped;
 #[cfg(feature = "kvm")]
@@ -1020,7 +1022,7 @@ pub struct DeviceManager {
     ged_notification_device: Option<Arc<Mutex<devices::AcpiGedDevice>>>,
 
     // VM configuration
-    config: Arc<Mutex<VmConfig>>,
+    config: Arc<Mutex<VmConfig<Active>>>,
 
     // Memory Manager
     memory_manager: Arc<Mutex<MemoryManager>>,
@@ -1203,7 +1205,7 @@ impl DeviceManager {
         io_bus: Arc<Bus>,
         mmio_bus: Arc<Bus>,
         vm: Arc<dyn hypervisor::Vm>,
-        config: Arc<Mutex<VmConfig>>,
+        config: Arc<Mutex<VmConfig<Active>>>,
         memory_manager: Arc<Mutex<MemoryManager>>,
         cpu_manager: Arc<Mutex<CpuManager>>,
         exit_evt: EventFd,
@@ -2920,7 +2922,7 @@ impl DeviceManager {
 
     fn make_virtio_net_device(
         &mut self,
-        net_cfg: &mut NetConfig,
+        net_cfg: &mut NetConfig<Active>,
         snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<MetaVirtioDevice> {
         let id = match net_cfg.pci_common.id.as_ref() {
@@ -3005,9 +3007,10 @@ impl DeviceManager {
                 ))
             } else if let Some(fds) = &net_cfg.fds {
                 debug!("Creating virtio-net device from network FDs: {fds:?}");
+                let fds_parameter: Vec<_> = fds.iter().map(|fd| fd.as_fd()).collect();
                 let net = virtio_devices::Net::from_tap_fds(
                     id.clone(),
-                    fds,
+                    &fds_parameter,
                     Some(net_cfg.mac),
                     net_cfg.mtu,
                     self.force_access_platform | net_cfg.pci_common.iommu,
@@ -3024,10 +3027,7 @@ impl DeviceManager {
                 )
                 .map_err(DeviceManagerError::CreateVirtioNet)?;
 
-                // SAFETY: 'fds' are valid because TAP devices are created successfully
-                unsafe {
-                    self.config.lock().unwrap().add_preserved_fds(fds.clone());
-                }
+                self.config.lock().unwrap().add_preserved_fds(fds.clone());
 
                 Arc::new(Mutex::new(net))
             } else {
@@ -4829,10 +4829,6 @@ impl DeviceManager {
                     debug!("Closing preserved FDs from virtio-net device: id={id}, fds={fds:?}");
                     for fd in fds {
                         config.preserved_fds.as_mut().unwrap().retain(|x| *x != fd);
-                        // SAFETY: We are closing the only remaining instance of this FD.
-                        unsafe {
-                            libc::close(fd);
-                        }
                     }
                 }
                 VirtioDeviceType::Block
@@ -5171,7 +5167,10 @@ impl DeviceManager {
         self.hotplug_virtio_pci_device(device)
     }
 
-    pub fn add_net(&mut self, net_cfg: &mut NetConfig) -> DeviceManagerResult<PciDeviceInfo> {
+    pub fn add_net(
+        &mut self,
+        net_cfg: &mut NetConfig<Active>,
+    ) -> DeviceManagerResult<PciDeviceInfo> {
         self.validate_identifier(&net_cfg.pci_common.id)?;
 
         if net_cfg.pci_common.iommu && !self.is_iommu_segment(net_cfg.pci_common.pci_segment) {

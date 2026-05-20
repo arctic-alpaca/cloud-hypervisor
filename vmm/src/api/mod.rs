@@ -44,6 +44,7 @@ use log::{info, trace};
 use micro_http::Body;
 use option_parser::{OptionParser, OptionParserError, Toggle};
 use serde::{Deserialize, Serialize};
+use serializable_fd::{Activatable, Active, Error, FdMarker, Serialized, StatusMarker};
 use thiserror::Error;
 use vm_migration::MigratableError;
 use vm_migration::progress::MigrationProgress;
@@ -228,8 +229,9 @@ pub enum ApiError {
 pub type ApiResult<T> = Result<T, ApiError>;
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(bound(deserialize = "VmConfig<Active>: Deserialize<'de>",))]
 pub struct VmInfoResponse {
-    pub config: Box<VmConfig>,
+    pub config: Box<VmConfig<Active>>,
     pub state: VmState,
     pub memory_actual_size: u64,
     pub device_tree: Option<DeviceTree>,
@@ -281,7 +283,11 @@ pub struct VmCoredumpData {
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 #[cfg_attr(test, derive(PartialEq))]
-pub struct VmReceiveMigrationData {
+#[serde(bound(deserialize = "RestoredNetConfig<S>: Deserialize<'de>",))]
+pub struct VmReceiveMigrationData<S>
+where
+    S: StatusMarker + FdMarker,
+{
     /// URL for the reception of migration state
     pub receiver_url: String,
     /// Directory containing the TLS server certificate (server-cert.pem), the TLS server key (server-key.pem), and the client TLS root CA certificate (ca-cert.pem).
@@ -289,7 +295,7 @@ pub struct VmReceiveMigrationData {
     pub tls_dir: Option<PathBuf>,
     /// Map with new network FDs on the new host.
     #[serde(default)]
-    pub net_fds: Vec<RestoredNetConfig>,
+    pub net_fds: Vec<RestoredNetConfig<S>>,
     /// Optional URL if the TCP serial configuration must be changed during
     /// migration. Example: "192.168.1.1:2222".
     #[serde(default)]
@@ -297,6 +303,25 @@ pub struct VmReceiveMigrationData {
     /// Optional memory zone reconfiguration data.
     #[serde(default)]
     pub zones: Vec<MemoryZoneConfig>,
+}
+
+impl Activatable for VmReceiveMigrationData<Serialized> {
+    type Activated = VmReceiveMigrationData<Active>;
+    type Ingest = <RestoredNetConfig<Serialized> as Activatable>::Ingest;
+
+    fn activate(self, ingest: &mut Self::Ingest) -> Result<Self::Activated, Error> {
+        Ok(VmReceiveMigrationData {
+            receiver_url: self.receiver_url,
+            tls_dir: self.tls_dir,
+            net_fds: self
+                .net_fds
+                .into_iter()
+                .map(|restored_net_config| restored_net_config.activate(ingest).unwrap())
+                .collect(),
+            tcp_serial_url: self.tcp_serial_url,
+            zones: self.zones,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -344,7 +369,7 @@ fn validate_tcp_migration_address(address: &str) -> Result<(), String> {
     Ok(())
 }
 
-impl VmReceiveMigrationData {
+impl VmReceiveMigrationData<Active> {
     pub const SYNTAX: &'static str = "VM receive migration parameters \
         \"<receiver_url>\" or \"receiver_url=<url>[,tls_dir=<path>,tcp_serial_url=<host:port>]\"";
 
@@ -713,7 +738,7 @@ pub enum ApiResponsePayload {
 pub type ApiResponse = Result<ApiResponsePayload, ApiError>;
 
 pub trait RequestHandler {
-    fn vm_create(&mut self, config: Box<VmConfig>) -> Result<(), VmError>;
+    fn vm_create(&mut self, config: Box<VmConfig<Active>>) -> Result<(), VmError>;
 
     fn vm_boot(&mut self) -> Result<(), VmError>;
 
@@ -725,7 +750,7 @@ pub trait RequestHandler {
 
     fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
 
-    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
+    fn vm_restore(&mut self, restore_cfg: RestoreConfig<Active>) -> Result<(), VmError>;
 
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     fn vm_coredump(&mut self, destination_url: &str) -> Result<(), VmError>;
@@ -773,7 +798,7 @@ pub trait RequestHandler {
 
     fn vm_add_pmem(&mut self, pmem_cfg: PmemConfig) -> Result<Option<Vec<u8>>, VmError>;
 
-    fn vm_add_net(&mut self, net_cfg: NetConfig) -> Result<Option<Vec<u8>>, VmError>;
+    fn vm_add_net(&mut self, net_cfg: NetConfig<Active>) -> Result<Option<Vec<u8>>, VmError>;
 
     fn vm_add_vdpa(&mut self, vdpa_cfg: VdpaConfig) -> Result<Option<Vec<u8>>, VmError>;
 
@@ -785,7 +810,7 @@ pub trait RequestHandler {
 
     fn vm_receive_migration(
         &mut self,
-        receive_data_migration: VmReceiveMigrationData,
+        receive_data_migration: VmReceiveMigrationData<Active>,
     ) -> Result<(), MigratableError>;
 
     /// Dispatches the migration.
@@ -1058,7 +1083,7 @@ impl ApiAction for VmAddPmem {
 pub struct VmAddNet;
 
 impl ApiAction for VmAddNet {
-    type RequestBody = NetConfig;
+    type RequestBody = NetConfig<Active>;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -1311,7 +1336,7 @@ impl ApiAction for VmCounters {
 pub struct VmCreate;
 
 impl ApiAction for VmCreate {
-    type RequestBody = Box<VmConfig>;
+    type RequestBody = Box<VmConfig<Active>>;
     type ResponseBody = ();
 
     fn request(
@@ -1520,7 +1545,7 @@ impl ApiAction for VmReboot {
 pub struct VmReceiveMigration;
 
 impl ApiAction for VmReceiveMigration {
-    type RequestBody = VmReceiveMigrationData;
+    type RequestBody = VmReceiveMigrationData<Active>;
     type ResponseBody = Option<Body>;
 
     fn request(&self, data: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
@@ -1736,7 +1761,7 @@ impl ApiAction for VmResizeZone {
 pub struct VmRestore;
 
 impl ApiAction for VmRestore {
-    type RequestBody = RestoreConfig;
+    type RequestBody = RestoreConfig<Active>;
     type ResponseBody = Option<Body>;
 
     fn request(

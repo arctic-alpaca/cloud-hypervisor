@@ -920,8 +920,10 @@ fn main() {
 
 #[cfg(test)]
 mod unit_tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
+    use serializable_fd::{Activatable, Active, Serialized};
     use vmm::config::VmParams;
     #[cfg(target_arch = "x86_64")]
     use vmm::vm_config::DebugConsoleConfig;
@@ -934,7 +936,7 @@ mod unit_tests {
     use crate::test_util::assert_args_sorted;
     use crate::{create_app, get_cli_options_sorted, prepare_default_values};
 
-    fn get_vm_config_from_vec(args: &[&str]) -> VmConfig {
+    fn get_vm_config_from_vec(args: &[&str]) -> VmConfig<Active> {
         let (default_vcpus, default_memory, default_rng) = prepare_default_values();
         let cmd_arguments =
             create_app(default_vcpus, default_memory, default_rng).get_matches_from(args);
@@ -947,9 +949,11 @@ mod unit_tests {
         cli: &[&str],
         openapi: &str,
         equal: bool,
-    ) -> (VmConfig, VmConfig) {
+    ) -> (VmConfig<Active>, VmConfig<Active>) {
         let cli_vm_config = get_vm_config_from_vec(cli);
-        let openapi_vm_config: VmConfig = serde_json::from_str(openapi).unwrap();
+        let openapi_vm_config: VmConfig<Serialized> = serde_json::from_str(openapi).unwrap();
+        //TODO(de_ser): is this correct?
+        let openapi_vm_config = openapi_vm_config.activate(&mut HashMap::new()).unwrap();
 
         if equal {
             assert_eq!(cli_vm_config, openapi_vm_config);

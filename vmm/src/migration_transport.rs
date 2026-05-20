@@ -22,6 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use log::{debug, error, info, warn};
 use serde_json;
+use serializable_fd::Active;
 use vm_memory::bitmap::BitmapSlice;
 use vm_memory::{
     Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, ReadVolatile, VolatileMemoryError,
@@ -1058,7 +1059,7 @@ pub(crate) fn send_request_expect_ok(
 /// Serialize and send the VM configuration payload.
 pub(crate) fn send_config(
     socket: &mut SocketStream,
-    config: &VmMigrationConfig,
+    config: &VmMigrationConfig<Active>,
 ) -> Result<(), MigratableError> {
     let config_data = serde_json::to_vec(config)
         .context("Error serializing VM migration config")
