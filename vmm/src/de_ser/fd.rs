@@ -63,10 +63,6 @@ impl Fd<Active> {
     pub fn new(owned_fd: OwnedFd) -> Self {
         Self { fd: owned_fd }
     }
-
-    pub fn activate(self, owned_fd: OwnedFd) -> Fd<Active> {
-        Fd { fd: owned_fd }
-    }
 }
 
 impl Default for Fd<Serialized> {
