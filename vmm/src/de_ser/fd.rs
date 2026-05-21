@@ -1,9 +1,12 @@
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::de_ser::activatable::FdList;
 use crate::de_ser::status_marker::{Active, Serialized, StatusMarker};
+use crate::de_ser::{Activatable, Error};
 
 //TODO(de_ser): remove
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone)]
@@ -49,13 +52,25 @@ where
     fd: <S as FdMarkerImpl>::InnerType,
 }
 
+impl FdList for Fd<Active> {
+    fn fd_list(&self, fds: &mut Vec<OwnedFd>) {
+        fds.push(self.fd.try_clone().unwrap());
+    }
+}
+
+impl Activatable for Fd<Serialized> {
+    type Activated = Fd<Active>;
+
+    fn activate(self, fds: &mut VecDeque<OwnedFd>) -> Result<Self::Activated, Error> {
+        Ok(Fd {
+            fd: fds.pop_front().unwrap(),
+        })
+    }
+}
+
 impl Fd<Serialized> {
     pub fn new(raw_fd: RawFd) -> Self {
         Self { fd: raw_fd }
-    }
-
-    pub fn activate(self, owned_fd: OwnedFd) -> Fd<Active> {
-        Fd { fd: owned_fd }
     }
 }
 

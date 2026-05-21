@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
 
 use thiserror::Error;
@@ -11,6 +12,9 @@ pub enum Error {
 
 pub trait Activatable {
     type Activated;
-    fn activate(self, fds: Vec<OwnedFd>) -> Result<Self::Activated, Error>;
-    fn fd_list(&self) -> Vec<OwnedFd>;
+    fn activate(self, fds: &mut VecDeque<OwnedFd>) -> Result<Self::Activated, Error>;
+}
+
+pub trait FdList {
+    fn fd_list(&self, fds: &mut Vec<OwnedFd>);
 }
