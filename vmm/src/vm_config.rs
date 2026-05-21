@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::net::IpAddr;
 use std::os::fd::OwnedFd;
@@ -12,14 +13,14 @@ use std::{fs, result};
 
 use block::ImageType;
 pub use block::fcntl::LockGranularityChoice;
-use log::{debug, warn};
+use log::warn;
 use net_util::MacAddr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
 
 use crate::Landlock;
-use crate::de_ser::{Activatable, Active, Fd, FdMarker, Serialized, StatusMarker};
+use crate::de_ser::{Activatable, Active, Fd, FdList, FdMarker, Serialized, StatusMarker};
 use crate::landlock::LandlockError;
 
 pub type LandlockResult<T> = result::Result<T, LandlockError>;
@@ -391,11 +392,45 @@ where
     pub offload_csum: bool,
 }
 
+impl FdList for NetConfig<Active> {
+    fn fd_list(&self, fds: &mut Vec<OwnedFd>) {
+        self.fds
+            .as_ref()
+            .map(|inner_fds| inner_fds.iter().map(|fd| fds.push(fd.clone().into())));
+    }
+}
+
 impl Activatable for NetConfig<Serialized> {
     type Activated = NetConfig<Active>;
 
-    fn activate(self, fds: Vec<OwnedFd>) -> Self::Activated {
-        todo!()
+    fn activate(
+        self,
+        fds: &mut VecDeque<OwnedFd>,
+    ) -> std::result::Result<NetConfig<Active>, crate::de_ser::Error> {
+        Ok(NetConfig {
+            pci_common: self.pci_common,
+            tap: self.tap,
+            ip: self.ip,
+            mask: self.mask,
+            mac: self.mac,
+            host_mac: self.host_mac,
+            mtu: self.mtu,
+            num_queues: self.num_queues,
+            queue_size: self.queue_size,
+            vhost_user: self.vhost_user,
+            vhost_socket: self.vhost_socket,
+            vhost_mode: self.vhost_mode,
+            fds: self.fds.map(|inner_fds| {
+                inner_fds
+                    .into_iter()
+                    .map(|fd| fd.activate(fds).unwrap())
+                    .collect()
+            }),
+            rate_limiter_config: self.rate_limiter_config,
+            offload_tso: self.offload_tso,
+            offload_ufo: self.offload_ufo,
+            offload_csum: self.offload_csum,
+        })
     }
 }
 
@@ -421,21 +456,6 @@ pub const DEFAULT_NET_QUEUE_SIZE: u16 = 256;
 
 pub fn default_netconfig_queue_size() -> u16 {
     DEFAULT_NET_QUEUE_SIZE
-}
-
-fn deserialize_netconfig_fds<'de, D>(d: D) -> Result<Option<Vec<i32>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fds: Option<Vec<i32>> = Option::deserialize(d)?;
-    if let Some(invalid_fds) = invalid_fds {
-        debug!(
-            "FDs in 'NetConfig' won't be deserialized as they are most likely invalid now. Deserializing them as -1."
-        );
-        Ok(Some(vec![-1; invalid_fds.len()]))
-    } else {
-        Ok(None)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -1085,11 +1105,57 @@ where
     pub ivshmem: Option<IvshmemConfig>,
 }
 
+impl FdList for VmConfig<Active> {
+    fn fd_list(&self, fds: &mut Vec<OwnedFd>) {
+        self.net
+            .as_ref()
+            .map(|nets| nets.iter().map(|net| net.fd_list(fds)));
+    }
+}
+
 impl Activatable for VmConfig<Serialized> {
     type Activated = VmConfig<Active>;
 
-    fn activate(self, fds: Vec<OwnedFd>) -> Self::Activated {
-        todo!()
+    fn activate(
+        self,
+        fds: &mut VecDeque<OwnedFd>,
+    ) -> Result<Self::Activated, crate::de_ser::Error> {
+        Ok(VmConfig {
+            cpus: self.cpus,
+            memory: self.memory,
+            payload: self.payload,
+            rate_limit_groups: self.rate_limit_groups,
+            disks: self.disks,
+            net: self.net.map(|nets| {
+                nets.into_iter()
+                    .map(|net| net.activate(fds).unwrap())
+                    .collect()
+            }),
+            rng: self.rng,
+            balloon: self.balloon,
+            generic_vhost_user: self.generic_vhost_user,
+            fs: self.fs,
+            pmem: self.pmem,
+            serial: self.serial,
+            console: self.console,
+            debug_console: self.debug_console,
+            devices: self.devices,
+            user_devices: self.user_devices,
+            vdpa: self.vdpa,
+            vsock: self.vsock,
+            pvpanic: self.pvpanic,
+            iommu: self.iommu,
+            numa: self.numa,
+            watchdog: self.watchdog,
+            pci_segments: self.pci_segments,
+            platform: self.platform,
+            tpm: self.tpm,
+            preserved_fds: self
+                .preserved_fds
+                .map(|x| x.into_iter().map(|fd| fd.activate(fds).unwrap()).collect()),
+            landlock_enable: false,
+            landlock_rules: None,
+        })
     }
 }
 

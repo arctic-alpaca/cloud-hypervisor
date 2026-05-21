@@ -90,6 +90,7 @@ use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 use crate::coredump::{
     CpuElf64Writable, DumpState, Elf64Writable, GuestDebuggable, GuestDebuggableError, NoteDescType,
 };
+use crate::de_ser::Active;
 use crate::device_manager::{DeviceManager, DeviceManagerError};
 use crate::device_tree::DeviceTree;
 #[cfg(feature = "guest_debug")]
@@ -526,7 +527,7 @@ pub struct Vm {
     initramfs: Option<File>,
     threads: Vec<thread::JoinHandle<()>>,
     device_manager: Arc<Mutex<DeviceManager>>,
-    config: Arc<Mutex<VmConfig>>,
+    config: Arc<Mutex<VmConfig<Active>>>,
     state: VmState,
     cpu_manager: Arc<Mutex<cpu::CpuManager>>,
     memory_manager: Arc<Mutex<MemoryManager>>,
@@ -563,7 +564,7 @@ impl Vm {
     #[allow(clippy::needless_pass_by_value)]
     #[allow(clippy::too_many_arguments)]
     pub fn new_from_memory_manager(
-        config: Arc<Mutex<VmConfig>>,
+        config: Arc<Mutex<VmConfig<Active>>>,
         memory_manager: Arc<Mutex<MemoryManager>>,
         vm: Arc<dyn hypervisor::Vm>,
         exit_evt: EventFd,
@@ -725,7 +726,7 @@ impl Vm {
 
     /// Determine if VIRTIO_F_ACCESS_PLATFORM should be forced based on
     /// confidential computing features.
-    fn should_force_access_platform(_config: &Arc<Mutex<VmConfig>>) -> bool {
+    fn should_force_access_platform(_config: &Arc<Mutex<VmConfig<Active>>>) -> bool {
         #[cfg(feature = "tdx")]
         if _config.lock().unwrap().is_tdx_enabled() {
             return true;
@@ -738,7 +739,7 @@ impl Vm {
     }
 
     /// Determine if VM should stop on boot (for debugging).
-    fn should_stop_on_boot(config: &Arc<Mutex<VmConfig>>) -> bool {
+    fn should_stop_on_boot(config: &Arc<Mutex<VmConfig<Active>>>) -> bool {
         #[cfg(feature = "guest_debug")]
         {
             config.lock().unwrap().gdb
@@ -753,7 +754,7 @@ impl Vm {
     /// Create and configure the CPU manager.
     #[allow(clippy::too_many_arguments)]
     fn create_cpu_manager(
-        config: &Arc<Mutex<VmConfig>>,
+        config: &Arc<Mutex<VmConfig<Active>>>,
         vm: Arc<dyn hypervisor::Vm>,
         exit_evt: EventFd,
         reset_evt: EventFd,
@@ -814,7 +815,7 @@ impl Vm {
     /// Initialize TDX if enabled.
     #[cfg(feature = "tdx")]
     fn init_tdx_if_enabled(
-        config: &Arc<Mutex<VmConfig>>,
+        config: &Arc<Mutex<VmConfig<Active>>>,
         vm: &Arc<dyn hypervisor::Vm>,
         cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
     ) -> Result<()> {
@@ -833,7 +834,7 @@ impl Vm {
         io_bus: Arc<Bus>,
         mmio_bus: Arc<Bus>,
         vm: Arc<dyn hypervisor::Vm>,
-        config: Arc<Mutex<VmConfig>>,
+        config: Arc<Mutex<VmConfig<Active>>>,
         memory_manager: Arc<Mutex<MemoryManager>>,
         cpu_manager: Arc<Mutex<cpu::CpuManager>>,
         exit_evt: EventFd,
@@ -887,7 +888,7 @@ impl Vm {
         memory_manager: &Arc<Mutex<MemoryManager>>,
         cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
         device_manager: &Arc<Mutex<DeviceManager>>,
-        config: &Arc<Mutex<VmConfig>>,
+        config: &Arc<Mutex<VmConfig<Active>>>,
         hypervisor: &Arc<dyn hypervisor::Hypervisor>,
         console_info: Option<&ConsoleInfo>,
         console_resize_pipe: Option<&Arc<File>>,
@@ -1323,7 +1324,7 @@ impl Vm {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        vm_config: Arc<Mutex<VmConfig>>,
+        vm_config: Arc<Mutex<VmConfig<Active>>>,
         exit_evt: EventFd,
         reset_evt: EventFd,
         guest_exit_evt: EventFd,
@@ -1785,7 +1786,7 @@ impl Vm {
 
     fn load_payload_async(
         memory_manager: &Arc<Mutex<MemoryManager>>,
-        config: &Arc<Mutex<VmConfig>>,
+        config: &Arc<Mutex<VmConfig<Active>>>,
         #[cfg(feature = "igvm")] cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
     ) -> Result<Option<thread::JoinHandle<Result<EntryPoint>>>> {
@@ -2374,7 +2375,7 @@ impl Vm {
         Ok(pci_device_info)
     }
 
-    pub fn add_net(&mut self, mut net_cfg: NetConfig) -> Result<PciDeviceInfo> {
+    pub fn add_net(&mut self, mut net_cfg: NetConfig<Active>) -> Result<PciDeviceInfo> {
         let pci_device_info = self
             .device_manager
             .lock()
@@ -3011,7 +3012,7 @@ impl Vm {
     }
 
     /// Gets a thread-safe reference counted pointer to the VM configuration.
-    pub fn get_config(&self) -> Arc<Mutex<VmConfig>> {
+    pub fn get_config(&self) -> Arc<Mutex<VmConfig<Active>>> {
         Arc::clone(&self.config)
     }
 

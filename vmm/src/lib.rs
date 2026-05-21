@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Read, Write, stdout};
+use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
 #[cfg(feature = "guest_debug")]
@@ -55,7 +56,7 @@ use crate::api::{
 use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
-use crate::de_ser::{Active, Fd, FdMarker, Serialized, StatusMarker};
+use crate::de_ser::{Activatable, Active, FdMarker, Serialized, StatusMarker};
 use crate::landlock::Landlock;
 use crate::memory_manager::MemoryManager;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -107,6 +108,7 @@ mod uffd;
 mod userfaultfd;
 pub mod vm;
 pub mod vm_config;
+pub use de_ser::FdList;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
@@ -609,6 +611,28 @@ where
     memory_manager_data: MemoryManagerSnapshotData,
 }
 
+impl FdList for VmMigrationConfig<Active> {
+    fn fd_list(&self, fds: &mut Vec<OwnedFd>) {
+        self.vm_config.lock().unwrap().fd_list(fds);
+    }
+}
+
+impl Activatable for VmMigrationConfig<Serialized> {
+    type Activated = VmMigrationConfig<Active>;
+
+    fn activate(
+        self,
+        fds: &mut VecDeque<OwnedFd>,
+    ) -> result::Result<Self::Activated, crate::de_ser::Error> {
+        let active_vm_config = self.vm_config.lock().unwrap().clone().activate(fds)?;
+        Ok(VmMigrationConfig {
+            vm_config: Arc::new(Mutex::new(active_vm_config)),
+            common_cpuid: self.common_cpuid,
+            memory_manager_data: self.memory_manager_data,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VmmVersionInfo {
     pub build_version: String,
@@ -1063,9 +1087,9 @@ impl Vmm {
                 MigratableError::MigrateReceive(anyhow!("Error deserialising config: {e}"))
             })?;
 
-        let config = Arc::new(Mutex::new(
-            vm_migration_config.vm_config.lock().unwrap().validate(),
-        ));
+        let vm_migration_config = vm_migration_config.activate(&mut VecDeque::new()).unwrap();
+
+        let config = vm_migration_config.vm_config;
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         self.vm_check_cpuid_compatibility(&config, &vm_migration_config.common_cpuid)?;
@@ -1619,7 +1643,7 @@ impl Vmm {
     fn vm_restore(
         &mut self,
         source_url: &str,
-        vm_config: Arc<Mutex<VmConfig<Serialized>>>,
+        vm_config: Arc<Mutex<VmConfig<Active>>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
     ) -> std::result::Result<(), VmError> {
@@ -1811,13 +1835,13 @@ impl Vmm {
     }
 }
 
-fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError> {
+fn apply_landlock(vm_config: &mut VmConfig<Active>) -> result::Result<(), LandlockError> {
     vm_config.apply_landlock()?;
     Ok(())
 }
 
 impl RequestHandler for Vmm {
-    fn vm_create(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
+    fn vm_create(&mut self, config: Box<VmConfig<Active>>) -> result::Result<(), VmError> {
         // We only store the passed VM config.
         // The VM will be created when being asked to boot it.
         if self.vm_config.is_some() {
@@ -1943,7 +1967,7 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
+    fn vm_restore(&mut self, restore_cfg: RestoreConfig<Active>) -> result::Result<(), VmError> {
         if self.vm.is_some() || self.vm_config.is_some() {
             return Err(VmError::VmAlreadyCreated);
         }
@@ -1956,7 +1980,10 @@ impl RequestHandler for Vmm {
         let source_url = source_url.unwrap();
 
         let vm_config = Arc::new(Mutex::new(
-            recv_vm_config(source_url).map_err(VmError::Restore)?,
+            recv_vm_config(source_url)
+                .map_err(VmError::Restore)?
+                .activate(&mut VecDeque::new())
+                .unwrap(),
         ));
         restore_cfg
             .validate(&vm_config.lock().unwrap().clone())
@@ -2413,7 +2440,10 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_add_net(&mut self, net_cfg: NetConfig) -> result::Result<Option<Vec<u8>>, VmError> {
+    fn vm_add_net(
+        &mut self,
+        net_cfg: NetConfig<Active>,
+    ) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
         {
@@ -2697,7 +2727,7 @@ mod unit_tests {
         .unwrap()
     }
 
-    fn create_dummy_vm_config() -> Box<VmConfig> {
+    fn create_dummy_vm_config() -> Box<VmConfig<Active>> {
         Box::new(VmConfig {
             cpus: CpusConfig {
                 boot_vcpus: 1,

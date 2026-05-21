@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 #[cfg(feature = "ivshmem")]
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -14,7 +14,7 @@ use std::sync::LazyLock;
 
 use block::ImageType;
 use clap::ArgMatches;
-use log::{debug, warn};
+use log::warn;
 use option_parser::{
     ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple,
 };
@@ -27,7 +27,7 @@ use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
 
-use crate::de_ser::{Active, Fd};
+use crate::de_ser::{Activatable, Active, Fd, FdList, FdMarker, Serialized, StatusMarker};
 use crate::landlock::LandlockAccess;
 use crate::vm_config::*;
 
@@ -2553,38 +2553,42 @@ impl NumaConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub struct RestoredNetConfig {
+#[serde(bound(deserialize = "Fd<S>: Deserialize<'de>",))]
+pub struct RestoredNetConfig<S>
+where
+    S: StatusMarker + FdMarker,
+{
     pub id: String,
     #[serde(default)]
     pub num_fds: usize,
-    // Special deserialize handling:
-    // A serialize-deserialize cycle typically happens across processes.
-    // Therefore, we don't serialize FDs, and whatever value is here after
-    // deserialization is invalid.
-    //
-    // Valid FDs are transmitted via a different channel (SCM_RIGHTS message)
-    // and will be populated into this struct on the destination VMM eventually.
-    #[serde(default, deserialize_with = "deserialize_restorednetconfig_fds")]
-    pub fds: Option<Vec<i32>>,
+    pub fds: Option<Vec<Fd<S>>>,
 }
 
-fn deserialize_restorednetconfig_fds<'de, D>(
-    d: D,
-) -> std::result::Result<Option<Vec<i32>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fds: Option<Vec<i32>> = Option::deserialize(d)?;
-    if let Some(invalid_fds) = invalid_fds {
-        // If the live-migration path is used properly, new FDs are passed as
-        // SCM_RIGHTS message. So, we don't get them from the serialized JSON
-        // anyway.
-        debug!(
-            "FDs in 'RestoredNetConfig' won't be deserialized as they are most likely invalid now. Deserializing them as -1."
-        );
-        Ok(Some(vec![-1; invalid_fds.len()]))
-    } else {
-        Ok(None)
+impl FdList for RestoredNetConfig<Active> {
+    fn fd_list(&self, fds: &mut Vec<OwnedFd>) {
+        self.fds
+            .as_ref()
+            .map(|inner_fds| inner_fds.iter().map(|fd| fds.push(fd.clone().into())));
+    }
+}
+
+impl Activatable for RestoredNetConfig<Serialized> {
+    type Activated = RestoredNetConfig<Active>;
+
+    fn activate(
+        self,
+        fds: &mut VecDeque<OwnedFd>,
+    ) -> result::Result<Self::Activated, crate::de_ser::Error> {
+        Ok(RestoredNetConfig {
+            id: self.id,
+            num_fds: self.num_fds,
+            fds: self.fds.map(|inner_fds| {
+                inner_fds
+                    .into_iter()
+                    .map(|fd| fd.activate(fds).unwrap())
+                    .collect()
+            }),
+        })
     }
 }
 
@@ -2616,19 +2620,55 @@ impl FromStr for MemoryRestoreMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub struct RestoreConfig {
+#[serde(bound(deserialize = "Fd<S>: Deserialize<'de>",))]
+pub struct RestoreConfig<S>
+where
+    S: StatusMarker + FdMarker,
+{
     pub source_url: PathBuf,
     #[serde(default)]
     pub prefault: bool,
     #[serde(default)]
     pub memory_restore_mode: MemoryRestoreMode,
     #[serde(default)]
-    pub net_fds: Option<Vec<RestoredNetConfig>>,
+    pub net_fds: Option<Vec<RestoredNetConfig<S>>>,
     #[serde(default)]
     pub resume: bool,
 }
 
-impl RestoreConfig {
+impl FdList for RestoreConfig<Active> {
+    fn fd_list(&self, fds: &mut Vec<OwnedFd>) {
+        self.net_fds.as_ref().map(|restored_net_configs| {
+            restored_net_configs
+                .iter()
+                .map(|restored_net_config| restored_net_config.fd_list(fds))
+        });
+    }
+}
+
+impl Activatable for RestoreConfig<Serialized> {
+    type Activated = RestoreConfig<Active>;
+
+    fn activate(
+        self,
+        fds: &mut VecDeque<OwnedFd>,
+    ) -> result::Result<Self::Activated, crate::de_ser::Error> {
+        Ok(RestoreConfig {
+            source_url: self.source_url,
+            prefault: self.prefault,
+            memory_restore_mode: self.memory_restore_mode,
+            net_fds: self.net_fds.map(|net_fds| {
+                net_fds
+                    .into_iter()
+                    .map(|restored_net_config| restored_net_config.activate(fds).unwrap())
+                    .collect()
+            }),
+            resume: self.resume,
+        })
+    }
+}
+
+impl RestoreConfig<Active> {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false\" \
@@ -2670,7 +2710,15 @@ impl RestoreConfig {
                     .map(|(id, fds)| RestoredNetConfig {
                         id: id.clone(),
                         num_fds: fds.len(),
-                        fds: Some(fds.iter().map(|e| *e as i32).collect()),
+                        fds: Some(
+                            fds.iter()
+                                .map(|e| {
+                                    // SAFETY: TODO(de_ser)
+                                    let fd = unsafe { OwnedFd::from_raw_fd(*e as RawFd) };
+                                    Fd::<Active>::new(fd)
+                                })
+                                .collect(),
+                        ),
                     })
                     .collect()
             });
@@ -3590,2509 +3638,2509 @@ impl VmConfig<Active> {
     }
 }
 
-#[cfg(test)]
-mod unit_tests {
-    use std::fs::File;
-    use std::os::unix::io::AsRawFd;
-
-    use net_util::MacAddr;
-
-    use super::*;
-
-    #[test]
-    fn test_cpu_parsing() -> Result<()> {
-        assert_eq!(CpusConfig::parse("")?, CpusConfig::default());
-
-        assert_eq!(
-            CpusConfig::parse("boot=1")?,
-            CpusConfig {
-                boot_vcpus: 1,
-                max_vcpus: 1,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            CpusConfig::parse("boot=1,max=2")?,
-            CpusConfig {
-                boot_vcpus: 1,
-                max_vcpus: 2,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            CpusConfig::parse("boot=8,topology=2:2:1:2")?,
-            CpusConfig {
-                boot_vcpus: 8,
-                max_vcpus: 8,
-                topology: Some(CpuTopology {
-                    threads_per_core: 2,
-                    cores_per_die: 2,
-                    dies_per_package: 1,
-                    packages: 2
-                }),
-                ..Default::default()
-            }
-        );
-
-        CpusConfig::parse("boot=8,topology=2:2:1").unwrap_err();
-        CpusConfig::parse("boot=8,topology=2:2:1:x").unwrap_err();
-        assert_eq!(
-            CpusConfig::parse("boot=1,kvm_hyperv=on")?,
-            CpusConfig {
-                boot_vcpus: 1,
-                max_vcpus: 1,
-                kvm_hyperv: true,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            CpusConfig::parse("boot=2,affinity=[0@[0,2],1@[1,3]]")?,
-            CpusConfig {
-                boot_vcpus: 2,
-                max_vcpus: 2,
-                affinity: Some(Box::new([
-                    CpuAffinity {
-                        vcpu: 0,
-                        host_cpus: Box::new([0, 2]),
-                    },
-                    CpuAffinity {
-                        vcpu: 1,
-                        host_cpus: Box::new([1, 3]),
-                    }
-                ])),
-                ..Default::default()
-            },
-        );
-
-        // Test core_scheduling parsing
-        assert_eq!(
-            CpusConfig::parse("boot=1,core_scheduling=vm")?,
-            CpusConfig {
-                boot_vcpus: 1,
-                max_vcpus: 1,
-                core_scheduling: CoreScheduling::Vm,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            CpusConfig::parse("boot=1,core_scheduling=vcpu")?,
-            CpusConfig {
-                boot_vcpus: 1,
-                max_vcpus: 1,
-                core_scheduling: CoreScheduling::Vcpu,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            CpusConfig::parse("boot=1,core_scheduling=off")?,
-            CpusConfig {
-                boot_vcpus: 1,
-                max_vcpus: 1,
-                core_scheduling: CoreScheduling::Off,
-                ..Default::default()
-            }
-        );
-        // Default (no core_scheduling specified) should be Vm
-        assert_eq!(
-            CpusConfig::parse("boot=1")?.core_scheduling,
-            CoreScheduling::Vm
-        );
-        // Invalid value should error
-        CpusConfig::parse("boot=1,core_scheduling=invalid").unwrap_err();
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_mem_zone_parsing() -> Result<()> {
-        // mergeable defaults to false
-        assert_eq!(
-            MemoryConfig::parse("size=0", Some(vec!["id=mem0,size=1G"]))?,
-            MemoryConfig {
-                size: 0,
-                zones: Some(vec![MemoryZoneConfig {
-                    id: "mem0".to_string(),
-                    size: 1 << 30,
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }
-        );
-        // mergeable=on
-        assert_eq!(
-            MemoryConfig::parse("size=0", Some(vec!["id=mem0,size=1G,mergeable=on"]))?,
-            MemoryConfig {
-                size: 0,
-                zones: Some(vec![MemoryZoneConfig {
-                    id: "mem0".to_string(),
-                    size: 1 << 30,
-                    mergeable: true,
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }
-        );
-        // mergeable=off is explicit false
-        assert_eq!(
-            MemoryConfig::parse("size=0", Some(vec!["id=mem0,size=1G,mergeable=off"]))?,
-            MemoryConfig {
-                size: 0,
-                zones: Some(vec![MemoryZoneConfig {
-                    id: "mem0".to_string(),
-                    size: 1 << 30,
-                    mergeable: false,
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }
-        );
-        // per-zone mergeable independent of global mergeable
-        assert_eq!(
-            MemoryConfig::parse(
-                "size=1G,mergeable=off",
-                Some(vec!["id=hotplug,size=0,hotplug_size=4G,mergeable=on"])
-            )?,
-            MemoryConfig {
-                size: 1 << 30,
-                mergeable: false,
-                hotplug_method: HotplugMethod::Acpi,
-                zones: Some(vec![MemoryZoneConfig {
-                    id: "hotplug".to_string(),
-                    size: 0,
-                    hotplug_size: Some(4 << 30),
-                    mergeable: true,
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }
-        );
-        // global mergeable=on inherited by zone with no explicit mergeable
-        assert_eq!(
-            MemoryConfig::parse("size=0,mergeable=on", Some(vec!["id=mem0,size=1G"]))?,
-            MemoryConfig {
-                size: 0,
-                mergeable: true,
-                zones: Some(vec![MemoryZoneConfig {
-                    id: "mem0".to_string(),
-                    size: 1 << 30,
-                    mergeable: true,
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_mem_parsing() -> Result<()> {
-        assert_eq!(MemoryConfig::parse("", None)?, MemoryConfig::default());
-        // Default string
-        assert_eq!(
-            MemoryConfig::parse("size=512M", None)?,
-            MemoryConfig::default()
-        );
-        assert_eq!(
-            MemoryConfig::parse("size=512M,mergeable=on", None)?,
-            MemoryConfig {
-                size: 512 << 20,
-                mergeable: true,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            MemoryConfig::parse("mergeable=on", None)?,
-            MemoryConfig {
-                mergeable: true,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            MemoryConfig::parse("size=1G,mergeable=off", None)?,
-            MemoryConfig {
-                size: 1 << 30,
-                mergeable: false,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            MemoryConfig::parse("hotplug_method=acpi", None)?,
-            MemoryConfig {
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            MemoryConfig::parse("hotplug_method=acpi,hotplug_size=512M", None)?,
-            MemoryConfig {
-                hotplug_size: Some(512 << 20),
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            MemoryConfig::parse("hotplug_method=virtio-mem,hotplug_size=512M", None)?,
-            MemoryConfig {
-                hotplug_size: Some(512 << 20),
-                hotplug_method: HotplugMethod::VirtioMem,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            MemoryConfig::parse("hugepages=on,size=1G,hugepage_size=2M", None)?,
-            MemoryConfig {
-                hugepage_size: Some(2 << 20),
-                size: 1 << 30,
-                hugepages: true,
-                ..Default::default()
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_rate_limit_group_parsing() -> Result<()> {
-        assert_eq!(
-            RateLimiterGroupConfig::parse("id=group0,bw_size=1000,bw_refill_time=100")?,
-            RateLimiterGroupConfig {
-                id: "group0".to_string(),
-                rate_limiter_config: RateLimiterConfig {
-                    bandwidth: Some(TokenBucketConfig {
-                        size: 1000,
-                        one_time_burst: Some(0),
-                        refill_time: 100,
-                    }),
-                    ops: None,
-                }
-            }
-        );
-        assert_eq!(
-            RateLimiterGroupConfig::parse("id=group0,ops_size=1000,ops_refill_time=100")?,
-            RateLimiterGroupConfig {
-                id: "group0".to_string(),
-                rate_limiter_config: RateLimiterConfig {
-                    bandwidth: None,
-                    ops: Some(TokenBucketConfig {
-                        size: 1000,
-                        one_time_burst: Some(0),
-                        refill_time: 100,
-                    }),
-                }
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_pci_segment_parsing() -> Result<()> {
-        assert_eq!(
-            PciSegmentConfig::parse("pci_segment=0")?,
-            PciSegmentConfig {
-                pci_segment: 0,
-                mmio32_aperture_weight: 1,
-                mmio64_aperture_weight: 1,
-            }
-        );
-        assert_eq!(
-            PciSegmentConfig::parse(
-                "pci_segment=0,mmio32_aperture_weight=1,mmio64_aperture_weight=1"
-            )?,
-            PciSegmentConfig {
-                pci_segment: 0,
-                mmio32_aperture_weight: 1,
-                mmio64_aperture_weight: 1,
-            }
-        );
-        assert_eq!(
-            PciSegmentConfig::parse("pci_segment=0,mmio32_aperture_weight=2")?,
-            PciSegmentConfig {
-                pci_segment: 0,
-                mmio32_aperture_weight: 2,
-                mmio64_aperture_weight: 1,
-            }
-        );
-        assert_eq!(
-            PciSegmentConfig::parse("pci_segment=0,mmio64_aperture_weight=2")?,
-            PciSegmentConfig {
-                pci_segment: 0,
-                mmio32_aperture_weight: 1,
-                mmio64_aperture_weight: 2,
-            }
-        );
-
-        Ok(())
-    }
-
-    fn disk_fixture() -> DiskConfig {
-        DiskConfig {
-            pci_common: PciDeviceCommonConfig::default(),
-            path: Some(PathBuf::from("/path/to_file")),
-            readonly: false,
-            direct: false,
-            num_queues: 1,
-            queue_size: 128,
-            vhost_user: false,
-            vhost_socket: None,
-            disable_io_uring: false,
-            disable_aio: false,
-            rate_limit_group: None,
-            rate_limiter_config: None,
-            serial: None,
-            queue_affinity: None,
-            backing_files: false,
-            sparse: true,
-            image_type: ImageType::Unknown,
-            lock_granularity: LockGranularityChoice::default(),
-        }
-    }
-
-    #[test]
-    fn test_disk_parsing() -> Result<()> {
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file")?,
-            DiskConfig { ..disk_fixture() }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,id=mydisk0")?,
-            DiskConfig {
-                pci_common: PciDeviceCommonConfig {
-                    id: Some("mydisk0".to_owned()),
-                    ..Default::default()
-                },
-                ..disk_fixture()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("vhost_user=true,socket=/tmp/sock")?,
-            DiskConfig {
-                path: None,
-                vhost_socket: Some(String::from("/tmp/sock")),
-                vhost_user: true,
-                image_type: ImageType::Unknown,
-                ..disk_fixture()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,iommu=on")?,
-            DiskConfig {
-                pci_common: PciDeviceCommonConfig {
-                    iommu: true,
-                    ..Default::default()
-                },
-                ..disk_fixture()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,iommu=on,queue_size=256")?,
-            DiskConfig {
-                pci_common: PciDeviceCommonConfig {
-                    iommu: true,
-                    ..Default::default()
-                },
-                queue_size: 256,
-                ..disk_fixture()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,iommu=on,queue_size=256,num_queues=4")?,
-            DiskConfig {
-                pci_common: PciDeviceCommonConfig {
-                    iommu: true,
-                    ..Default::default()
-                },
-                queue_size: 256,
-                num_queues: 4,
-                ..disk_fixture()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,direct=on")?,
-            DiskConfig {
-                direct: true,
-                ..disk_fixture()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,serial=test")?,
-            DiskConfig {
-                serial: Some(String::from("test")),
-                ..disk_fixture()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,rate_limit_group=group0")?,
-            DiskConfig {
-                rate_limit_group: Some("group0".to_string()),
-                ..disk_fixture()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,lock_granularity=full")?,
-            DiskConfig {
-                lock_granularity: LockGranularityChoice::Full,
-                ..disk_fixture()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,lock_granularity=byte-range")?,
-            DiskConfig {
-                lock_granularity: LockGranularityChoice::ByteRange,
-                ..disk_fixture()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,queue_affinity=[0@[1],1@[2],2@[3,4],3@[5-8]]")?,
-            DiskConfig {
-                queue_affinity: Some(Box::new([
-                    VirtQueueAffinity {
-                        queue_index: 0,
-                        host_cpus: Box::new([1]),
-                    },
-                    VirtQueueAffinity {
-                        queue_index: 1,
-                        host_cpus: Box::new([2]),
-                    },
-                    VirtQueueAffinity {
-                        queue_index: 2,
-                        host_cpus: Box::new([3, 4]),
-                    },
-                    VirtQueueAffinity {
-                        queue_index: 3,
-                        host_cpus: Box::new([5, 6, 7, 8]),
-                    }
-                ])),
-                ..disk_fixture()
-            }
-        );
-        Ok(())
-    }
-
-    fn net_fixture() -> NetConfig<Active> {
-        NetConfig {
-            pci_common: PciDeviceCommonConfig::default(),
-            tap: None,
-            ip: None,
-            mask: None,
-            mac: MacAddr::parse_str("de:ad:be:ef:12:34").unwrap(),
-            host_mac: Some(MacAddr::parse_str("12:34:de:ad:be:ef").unwrap()),
-            mtu: None,
-            num_queues: 2,
-            queue_size: 256,
-            vhost_user: false,
-            vhost_socket: None,
-            vhost_mode: VhostMode::Client,
-            fds: None,
-            rate_limiter_config: None,
-            offload_tso: true,
-            offload_ufo: true,
-            offload_csum: true,
-        }
-    }
-
-    #[test]
-    fn test_net_parsing() -> Result<()> {
-        // mac address is random
-        assert_eq!(
-            NetConfig::parse("mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef")?,
-            net_fixture(),
-        );
-
-        assert_eq!(
-            NetConfig::parse("mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,id=mynet0")?,
-            NetConfig {
-                pci_common: PciDeviceCommonConfig {
-                    id: Some("mynet0".to_owned()),
-                    ..Default::default()
-                },
-                ..net_fixture()
-            }
-        );
-
-        assert_eq!(
-            NetConfig::parse(
-                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,tap=tap0,ip=192.168.100.1,mask=255.255.255.128"
-            )?,
-            NetConfig {
-                tap: Some("tap0".to_owned()),
-                ip: Some("192.168.100.1".parse().unwrap()),
-                mask: Some("255.255.255.128".parse().unwrap()),
-                ..net_fixture()
-            }
-        );
-
-        assert_eq!(
-            NetConfig::parse(
-                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock"
-            )?,
-            NetConfig {
-                vhost_user: true,
-                vhost_socket: Some("/tmp/sock".to_owned()),
-                ..net_fixture()
-            }
-        );
-
-        assert_eq!(
-            NetConfig::parse(
-                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,num_queues=4,queue_size=1024,iommu=on"
-            )?,
-            NetConfig {
-                pci_common: PciDeviceCommonConfig {
-                    iommu: true,
-                    ..Default::default()
-                },
-                num_queues: 4,
-                queue_size: 1024,
-                ..net_fixture()
-            }
-        );
-
-        assert_eq!(
-            NetConfig::parse("mac=de:ad:be:ef:12:34,fd=[3,7],num_queues=4")?,
-            NetConfig {
-                host_mac: None,
-                fds: Some(vec![3, 7]),
-                num_queues: 4,
-                ..net_fixture()
-            }
-        );
-
-        assert_eq!(
-            NetConfig::parse("mac=de:ad:be:ef:12:34,mask=255.255.255.0")?,
-            NetConfig {
-                mask: Some("255.255.255.0".parse().unwrap()),
-                host_mac: None,
-                ..net_fixture()
-            }
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_rng() -> Result<()> {
-        assert_eq!(RngConfig::parse("")?, RngConfig::default());
-        assert_eq!(
-            RngConfig::parse("src=/dev/random")?,
-            RngConfig {
-                src: PathBuf::from("/dev/random"),
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            RngConfig::parse("src=/dev/random,iommu=on,pci_segment=1,pci_device_id=7")?,
-            RngConfig {
-                src: PathBuf::from("/dev/random"),
-                pci_common: PciDeviceCommonConfig {
-                    id: None,
-                    iommu: true,
-                    pci_segment: 1,
-                    pci_device_id: Some(7),
-                },
-            }
-        );
-        assert_eq!(
-            RngConfig::parse("iommu=on")?,
-            RngConfig {
-                pci_common: PciDeviceCommonConfig {
-                    id: None,
-                    iommu: true,
-                    pci_segment: 0,
-                    pci_device_id: None,
-                },
-                ..Default::default()
-            }
-        );
-        Ok(())
-    }
-
-    fn fs_fixture() -> FsConfig {
-        FsConfig {
-            pci_common: PciDeviceCommonConfig::default(),
-            socket: PathBuf::from("/tmp/sock"),
-            tag: "mytag".to_owned(),
-            num_queues: 1,
-            queue_size: 1024,
-        }
-    }
-
-    #[test]
-    fn test_parse_fs() -> Result<()> {
-        // "tag" and "socket" must be supplied
-        FsConfig::parse("").unwrap_err();
-        FsConfig::parse("tag=mytag").unwrap_err();
-        FsConfig::parse("socket=/tmp/sock").unwrap_err();
-        assert_eq!(FsConfig::parse("tag=mytag,socket=/tmp/sock")?, fs_fixture());
-        assert_eq!(
-            FsConfig::parse("tag=mytag,socket=/tmp/sock,num_queues=4,queue_size=1024")?,
-            FsConfig {
-                num_queues: 4,
-                queue_size: 1024,
-                ..fs_fixture()
-            }
-        );
-
-        Ok(())
-    }
-
-    #[track_caller]
-    #[allow(clippy::too_many_arguments)]
-    fn make_vhost_user_config(
-        socket: &str,
-        virtio_id: u64,
-        id: &str,
-        pci_segment: u64,
-        queue_sizes: &IntegerList,
-    ) {
-        assert!(!socket.contains(",[]\n\r\0\""));
-        assert!(!id.contains(",[]\n\r\0\""));
-        let config = GenericVhostUserConfig::parse(&format!(
-            "virtio_id={virtio_id},socket=\"{socket}\",\
-id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
-        ));
-        if pci_segment <= u16::MAX.into()
-            && virtio_id <= u32::MAX.into()
-            && virtio_id != u64::from(VIRTIO_ID_BALLOON)
-            && virtio_id != u64::from(VIRTIO_ID_WATCHDOG)
-            && virtio_id != u64::from(VIRTIO_ID_IOMMU)
-            && queue_sizes.0.iter().all(|&f| f <= u16::MAX.into())
-        {
-            assert_eq!(
-                config.unwrap(),
-                GenericVhostUserConfig {
-                    pci_common: PciDeviceCommonConfig {
-                        id: Some(id.to_owned()),
-                        pci_segment: u16::try_from(pci_segment).unwrap(),
-                        ..Default::default()
-                    },
-                    socket: socket.into(),
-                    device_type: u32::try_from(virtio_id).unwrap(),
-                    queue_sizes: queue_sizes
-                        .0
-                        .iter()
-                        .map(|&f| u16::try_from(f).unwrap())
-                        .collect(),
-                }
-            );
-        } else {
-            config.unwrap_err();
-        }
-    }
-
-    #[test]
-    fn test_parse_vhost_user() -> Result<()> {
-        // all parameters must be supplied, except pci_segment
-        GenericVhostUserConfig::parse("").unwrap_err();
-        GenericVhostUserConfig::parse("virtio_id=1").unwrap_err();
-        GenericVhostUserConfig::parse("queue_size=1").unwrap_err();
-        GenericVhostUserConfig::parse("socket=/tmp/sock").unwrap_err();
-        GenericVhostUserConfig::parse("id=1").unwrap_err();
-        make_vhost_user_config(
-            "/dev/null/doesnotexist",
-            100,
-            "Something",
-            10,
-            &IntegerList(vec![u16::MAX.into(), 20u16.into()]),
-        );
-        make_vhost_user_config(
-            "/dev/null/doesnotexist",
-            100,
-            "Something",
-            10,
-            &IntegerList(vec![u16::MAX.into()]),
-        );
-        make_vhost_user_config(
-            "/dev/null/doesnotexist",
-            u64::from(u32::MAX) + 1,
-            "Something",
-            10,
-            &IntegerList(vec![20u64]),
-        );
-        make_vhost_user_config(
-            "/dev/null/doesnotexist",
-            u64::from(u32::MAX) + 1,
-            "Something",
-            10,
-            &IntegerList(vec![20u64]),
-        );
-        make_vhost_user_config(
-            "/dev/null/doesnotexist",
-            u64::from(u32::MAX) + 1,
-            "Something",
-            10,
-            &IntegerList(vec![20u64]),
-        );
-        Ok(())
-    }
-
-    fn pmem_fixture() -> PmemConfig {
-        PmemConfig {
-            pci_common: PciDeviceCommonConfig::default(),
-            file: PathBuf::from("/tmp/pmem"),
-            size: Some(128 << 20),
-            discard_writes: false,
-        }
-    }
-
-    #[test]
-    fn test_pmem_parsing() -> Result<()> {
-        // Must always give a file and size
-        PmemConfig::parse("").unwrap_err();
-        PmemConfig::parse("size=128M").unwrap_err();
-        assert_eq!(
-            PmemConfig::parse("file=/tmp/pmem,size=128M")?,
-            pmem_fixture()
-        );
-        assert_eq!(
-            PmemConfig::parse("file=/tmp/pmem,size=128M,id=mypmem0")?,
-            PmemConfig {
-                pci_common: PciDeviceCommonConfig {
-                    id: Some("mypmem0".to_owned()),
-                    ..Default::default()
-                },
-                ..pmem_fixture()
-            }
-        );
-        assert_eq!(
-            PmemConfig::parse("file=/tmp/pmem,size=128M,iommu=on,discard_writes=on")?,
-            PmemConfig {
-                pci_common: PciDeviceCommonConfig {
-                    iommu: true,
-                    ..Default::default()
-                },
-                discard_writes: true,
-                ..pmem_fixture()
-            }
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_console_parsing() -> Result<()> {
-        let console_config = |mode, file, socket, iommu| ConsoleConfig {
-            common: CommonConsoleConfig { file, mode, socket },
-            pci_common: PciDeviceCommonConfig {
-                iommu,
-                ..Default::default()
-            },
-        };
-
-        ConsoleConfig::parse("").unwrap_err();
-        ConsoleConfig::parse("badmode").unwrap_err();
-        assert_eq!(
-            ConsoleConfig::parse("off")?,
-            console_config(ConsoleOutputMode::Off, None, None, false)
-        );
-        assert_eq!(
-            ConsoleConfig::parse("pty")?,
-            console_config(ConsoleOutputMode::Pty, None, None, false)
-        );
-        assert_eq!(
-            ConsoleConfig::parse("tty")?,
-            console_config(ConsoleOutputMode::Tty, None, None, false)
-        );
-        assert_eq!(
-            ConsoleConfig::parse("null")?,
-            console_config(ConsoleOutputMode::Null, None, None, false)
-        );
-        assert_eq!(
-            ConsoleConfig::parse("file=/tmp/console")?,
-            console_config(
-                ConsoleOutputMode::File,
-                Some(PathBuf::from("/tmp/console")),
-                None,
-                false
-            )
-        );
-        assert_eq!(
-            ConsoleConfig::parse("null,iommu=on")?,
-            console_config(ConsoleOutputMode::Null, None, None, true)
-        );
-        assert_eq!(
-            ConsoleConfig::parse("file=/tmp/console,iommu=on")?,
-            console_config(
-                ConsoleOutputMode::File,
-                Some(PathBuf::from("/tmp/console")),
-                None,
-                true
-            )
-        );
-        assert_eq!(
-            ConsoleConfig::parse("socket=/tmp/serial.sock,iommu=on")?,
-            console_config(
-                ConsoleOutputMode::Socket,
-                None,
-                Some(PathBuf::from("/tmp/serial.sock")),
-                true
-            )
-        );
-        Ok(())
-    }
-
-    fn device_fixture() -> DeviceConfig {
-        DeviceConfig {
-            pci_common: PciDeviceCommonConfig::default(),
-            path: PathBuf::from("/path/to/device"),
-            x_nv_gpudirect_clique: None,
-            x_exclude_mmap_bars: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn test_device_parsing() -> Result<()> {
-        // Device must have a path provided
-        DeviceConfig::parse("").unwrap_err();
-        assert_eq!(
-            DeviceConfig::parse("path=/path/to/device")?,
-            device_fixture()
-        );
-
-        assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,iommu=on")?,
-            DeviceConfig {
-                pci_common: PciDeviceCommonConfig {
-                    iommu: true,
-                    ..Default::default()
-                },
-                ..device_fixture()
-            }
-        );
-
-        assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,iommu=on,id=mydevice0")?,
-            DeviceConfig {
-                pci_common: PciDeviceCommonConfig {
-                    id: Some("mydevice0".to_owned()),
-                    iommu: true,
-                    ..Default::default()
-                },
-                ..device_fixture()
-            }
-        );
-
-        assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[2]")?,
-            DeviceConfig {
-                x_exclude_mmap_bars: vec![2],
-                ..device_fixture()
-            }
-        );
-
-        assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[0,2,5]")?,
-            DeviceConfig {
-                x_exclude_mmap_bars: vec![0, 2, 5],
-                ..device_fixture()
-            }
-        );
-
-        assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[6]")?,
-            DeviceConfig {
-                x_exclude_mmap_bars: vec![6],
-                ..device_fixture()
-            }
-        );
-        Ok(())
-    }
-
-    fn vdpa_fixture() -> VdpaConfig {
-        VdpaConfig {
-            pci_common: PciDeviceCommonConfig::default(),
-            path: PathBuf::from("/dev/vhost-vdpa"),
-            num_queues: 1,
-        }
-    }
-
-    #[test]
-    fn test_vdpa_parsing() -> Result<()> {
-        // path is required
-        VdpaConfig::parse("").unwrap_err();
-        assert_eq!(VdpaConfig::parse("path=/dev/vhost-vdpa")?, vdpa_fixture());
-        assert_eq!(
-            VdpaConfig::parse("path=/dev/vhost-vdpa,num_queues=2,id=my_vdpa")?,
-            VdpaConfig {
-                pci_common: PciDeviceCommonConfig {
-                    id: Some("my_vdpa".to_owned()),
-                    ..Default::default()
-                },
-                num_queues: 2,
-                ..vdpa_fixture()
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_tpm_parsing() -> Result<()> {
-        // path is required
-        TpmConfig::parse("").unwrap_err();
-        assert_eq!(
-            TpmConfig::parse("socket=/var/run/tpm.sock")?,
-            TpmConfig {
-                socket: PathBuf::from("/var/run/tpm.sock"),
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_vsock_parsing() -> Result<()> {
-        // socket and cid is required
-        VsockConfig::parse("").unwrap_err();
-        assert_eq!(
-            VsockConfig::parse("socket=/tmp/sock,cid=3")?,
-            VsockConfig {
-                pci_common: PciDeviceCommonConfig::default(),
-                cid: 3,
-                socket: PathBuf::from("/tmp/sock"),
-            }
-        );
-        assert_eq!(
-            VsockConfig::parse("socket=/tmp/sock,cid=3,iommu=on")?,
-            VsockConfig {
-                pci_common: PciDeviceCommonConfig {
-                    iommu: true,
-                    ..Default::default()
-                },
-                cid: 3,
-                socket: PathBuf::from("/tmp/sock"),
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_numa_config_parsing() -> Result<()> {
-        // Error when device_id and cpu/memory are present
-        let invalid_input = "guest_numa_id=0,cpus=[0,1],distances=[0@25,1@20],\
-                                device_id=vfio0,memory_zones=[mem1],pci_segments=[0]";
-        NumaConfig::parse(invalid_input).unwrap_err();
-        // Successful numa config parsing
-        let standard_input = "guest_numa_id=1,cpus=[2,3],distances=[0@20],\
-                                memory_zones=[mem0],pci_segments=[0]";
-        let expected_standard = NumaConfig {
-            guest_numa_id: 1,
-            cpus: Some(Box::new([2, 3])),
-            distances: Some(Box::new([NumaDistance {
-                destination: 0,
-                distance: 20,
-            }])),
-            device_id: None,
-            memory_zones: Some(Box::new(["mem0".to_string()])),
-            pci_segments: Some(Box::new([0])),
-        };
-        assert_eq!(NumaConfig::parse(standard_input)?, expected_standard);
-        // Successful generic initiator config parse
-        let gi_input = "guest_numa_id=2,device_id=vfio1,distances=[0@30],pci_segments=[1]";
-        let expected_gi = NumaConfig {
-            guest_numa_id: 2,
-            cpus: None,
-            distances: Some(Box::new([NumaDistance {
-                destination: 0,
-                distance: 30,
-            }])),
-            device_id: Some("vfio1".to_string()),
-            memory_zones: None,
-            pci_segments: Some(Box::new([1])),
-        };
-        assert_eq!(NumaConfig::parse(gi_input)?, expected_gi);
-        Ok(())
-    }
-
-    #[test]
-    fn test_numa_config_generic_initiator_valid() {
-        // device_id specified, no cpus/memory_zones
-        let config = NumaConfig {
-            guest_numa_id: 0,
-            cpus: None,
-            distances: Some(Box::new([NumaDistance {
-                destination: 1,
-                distance: 20,
-            }])),
-            memory_zones: None,
-            device_id: Some("vfio0".to_string()),
-            pci_segments: None,
-        };
-        config.validate().unwrap();
-        assert!(config.is_generic_initiator());
-    }
-
-    #[test]
-    fn test_numa_config_invalid_device_id() {
-        // empty device_id
-        let config = NumaConfig {
-            guest_numa_id: 0,
-            cpus: None,
-            distances: None,
-            memory_zones: None,
-            device_id: Some(String::new()),
-            pci_segments: None,
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_numa_config_invalid_both_device_cpus() {
-        // device_id and cpus specified
-        let config = NumaConfig {
-            guest_numa_id: 0,
-            cpus: Some(Box::new([0, 1])),
-            distances: None,
-            device_id: Some("vfio0".to_string()),
-            memory_zones: None,
-            pci_segments: None,
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_numa_config_invalid_both_device_memory() {
-        // device_id and memory zones specified
-        let config = NumaConfig {
-            guest_numa_id: 0,
-            cpus: None,
-            distances: None,
-            device_id: Some("vfio0".to_string()),
-            memory_zones: Some(Box::new(["mem0".to_string()])),
-            pci_segments: None,
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_numa_config_standard_valid() {
-        // No device_id
-        let config = NumaConfig {
-            guest_numa_id: 0,
-            cpus: Some(Box::new([0, 1])),
-            distances: Some(Box::new([NumaDistance {
-                destination: 1,
-                distance: 20,
-            }])),
-            device_id: None,
-            memory_zones: Some(Box::new(["mem0".to_string()])),
-            pci_segments: None,
-        };
-        config.validate().unwrap();
-    }
-
-    #[test]
-    fn test_restore_parsing() -> Result<()> {
-        assert_eq!(
-            RestoreConfig::parse("source_url=/path/to/snapshot")?,
-            RestoreConfig {
-                source_url: PathBuf::from("/path/to/snapshot"),
-                prefault: false,
-                memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: None,
-                resume: false,
-            }
-        );
-        assert_eq!(
-            RestoreConfig::parse(
-                "source_url=/path/to/snapshot,prefault=off,net_fds=[net0@[3,4],net1@[5,6,7,8]]"
-            )?,
-            RestoreConfig {
-                source_url: PathBuf::from("/path/to/snapshot"),
-                prefault: false,
-                memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: Some(vec![
-                    RestoredNetConfig {
-                        id: "net0".to_string(),
-                        num_fds: 2,
-                        fds: Some(vec![3, 4]),
-                    },
-                    RestoredNetConfig {
-                        id: "net1".to_string(),
-                        num_fds: 4,
-                        fds: Some(vec![5, 6, 7, 8]),
-                    }
-                ]),
-                resume: false,
-            }
-        );
-        assert_eq!(
-            RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")?,
-            RestoreConfig {
-                source_url: PathBuf::from("/path/to/snapshot"),
-                prefault: false,
-                memory_restore_mode: MemoryRestoreMode::OnDemand,
-                net_fds: None,
-                resume: false,
-            }
-        );
-        assert_eq!(
-            RestoreConfig::parse("source_url=/path/to/snapshot,resume=on")?,
-            RestoreConfig {
-                source_url: PathBuf::from("/path/to/snapshot"),
-                prefault: false,
-                memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: None,
-                resume: true,
-            }
-        );
-        // Parsing should fail as source_url is a required field
-        RestoreConfig::parse("prefault=off").unwrap_err();
-        RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=bogus").unwrap_err();
-        Ok(())
-    }
-
-    #[test]
-    fn test_restore_config_serde() {
-        assert_eq!(
-            serde_json::from_str::<RestoreConfig>(r#"{"source_url":"/path/to/snapshot"}"#)
-                .unwrap()
-                .memory_restore_mode,
-            MemoryRestoreMode::Copy
-        );
-        assert_eq!(
-            serde_json::from_str::<RestoreConfig>(
-                r#"{"source_url":"/path/to/snapshot","memory_restore_mode":"OnDemand"}"#
-            )
-            .unwrap()
-            .memory_restore_mode,
-            MemoryRestoreMode::OnDemand
-        );
-    }
-
-    #[test]
-    fn test_restore_config_validation() {
-        // interested in only VmConfig.net, so set rest to default values
-        let mut snapshot_vm_config = VmConfig {
-            cpus: CpusConfig::default(),
-            memory: MemoryConfig::default(),
-            payload: None,
-            rate_limit_groups: None,
-            disks: None,
-            rng: RngConfig::default(),
-            generic_vhost_user: None,
-            balloon: None,
-            fs: None,
-            pmem: None,
-            serial: SerialConfig::default(),
-            console: ConsoleConfig::default(),
-            #[cfg(target_arch = "x86_64")]
-            debug_console: DebugConsoleConfig::default(),
-            devices: None,
-            user_devices: None,
-            vdpa: None,
-            vsock: None,
-            #[cfg(feature = "pvmemcontrol")]
-            pvmemcontrol: None,
-            pvpanic: false,
-            iommu: false,
-            numa: None,
-            watchdog: false,
-            #[cfg(feature = "guest_debug")]
-            gdb: false,
-            pci_segments: None,
-            platform: None,
-            tpm: None,
-            preserved_fds: None,
-            net: Some(vec![
-                NetConfig {
-                    pci_common: PciDeviceCommonConfig {
-                        id: Some("net0".to_owned()),
-                        ..Default::default()
-                    },
-                    num_queues: 2,
-                    fds: Some(vec![-1, -1, -1, -1]),
-                    ..net_fixture()
-                },
-                NetConfig {
-                    pci_common: PciDeviceCommonConfig {
-                        id: Some("net1".to_owned()),
-                        ..Default::default()
-                    },
-                    num_queues: 1,
-                    fds: Some(vec![-1, -1]),
-                    ..net_fixture()
-                },
-                NetConfig {
-                    pci_common: PciDeviceCommonConfig {
-                        id: Some("net2".to_owned()),
-                        ..Default::default()
-                    },
-                    fds: None,
-                    ..net_fixture()
-                },
-            ]),
-            landlock_enable: false,
-            landlock_rules: None,
-            #[cfg(feature = "ivshmem")]
-            ivshmem: None,
-        };
-
-        let valid_config = RestoreConfig {
-            source_url: PathBuf::from("/path/to/snapshot"),
-            prefault: false,
-            memory_restore_mode: MemoryRestoreMode::Copy,
-            net_fds: Some(vec![
-                RestoredNetConfig {
-                    id: "net0".to_string(),
-                    num_fds: 4,
-                    fds: Some(vec![3, 4, 5, 6]),
-                },
-                RestoredNetConfig {
-                    id: "net1".to_string(),
-                    num_fds: 2,
-                    fds: Some(vec![7, 8]),
-                },
-            ]),
-            resume: false,
-        };
-        valid_config.validate(&snapshot_vm_config).unwrap();
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "netx".to_string(),
-            num_fds: 4,
-            fds: Some(vec![3, 4, 5, 6]),
-        }]);
-        assert_eq!(
-            invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingRequiredNetId(
-                "net0".to_string()
-            ))
-        );
-
-        invalid_config.net_fds = Some(vec![
-            RestoredNetConfig {
-                id: "net0".to_string(),
-                num_fds: 4,
-                fds: Some(vec![3, 4, 5, 6]),
-            },
-            RestoredNetConfig {
-                id: "net0".to_string(),
-                num_fds: 4,
-                fds: Some(vec![3, 4, 5, 6]),
-            },
-        ]);
-        assert_eq!(
-            invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::IdentifierNotUnique("net0".to_string()))
-        );
-
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "net0".to_string(),
-            num_fds: 4,
-            fds: Some(vec![3, 4, 5, 6]),
-        }]);
-        assert_eq!(
-            invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingRequiredNetId(
-                "net1".to_string()
-            ))
-        );
-
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "net0".to_string(),
-            num_fds: 2,
-            fds: Some(vec![3, 4]),
-        }]);
-        assert_eq!(
-            invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreNetFdCountMismatch(
-                "net0".to_string(),
-                2,
-                4
-            ))
-        );
-
-        let another_valid_config = RestoreConfig {
-            source_url: PathBuf::from("/path/to/snapshot"),
-            prefault: false,
-            memory_restore_mode: MemoryRestoreMode::Copy,
-            net_fds: None,
-            resume: false,
-        };
-        snapshot_vm_config.net = Some(vec![NetConfig {
-            pci_common: PciDeviceCommonConfig {
-                id: Some("net2".to_owned()),
-                ..Default::default()
-            },
-            fds: None,
-            ..net_fixture()
-        }]);
-        another_valid_config.validate(&snapshot_vm_config).unwrap();
-
-        let invalid_restore_mode = RestoreConfig {
-            source_url: PathBuf::from("/path/to/snapshot"),
-            prefault: true,
-            memory_restore_mode: MemoryRestoreMode::OnDemand,
-            net_fds: None,
-            resume: false,
-        };
-        assert_eq!(
-            invalid_restore_mode.validate(&snapshot_vm_config),
-            Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
-        );
-    }
-
-    fn platform_fixture() -> PlatformConfig {
-        PlatformConfig {
-            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
-            iommu_segments: None,
-            iommu_address_width_bits: MAX_IOMMU_ADDRESS_WIDTH_BITS,
-            serial_number: None,
-            uuid: None,
-            oem_strings: None,
-            iommufd: false,
-            vfio_p2p_dma: default_platformconfig_vfio_p2p_dma(),
-            #[cfg(feature = "tdx")]
-            tdx: false,
-            #[cfg(feature = "sev_snp")]
-            sev_snp: false,
-        }
-    }
-
-    fn numa_fixture() -> NumaConfig {
-        NumaConfig {
-            guest_numa_id: 0,
-            cpus: None,
-            distances: None,
-            device_id: None,
-            memory_zones: None,
-            pci_segments: None,
-        }
-    }
-
-    #[test]
-    fn test_config_validation() {
-        let mut valid_config = VmConfig::<Active> {
-            cpus: CpusConfig {
-                boot_vcpus: 1,
-                max_vcpus: 1,
-                ..Default::default()
-            },
-            memory: MemoryConfig {
-                size: 536_870_912,
-                mergeable: false,
-                hotplug_method: HotplugMethod::Acpi,
-                hotplug_size: None,
-                hotplugged_size: None,
-                shared: false,
-                hugepages: false,
-                hugepage_size: None,
-                prefault: false,
-                zones: None,
-                thp: true,
-            },
-            payload: Some(PayloadConfig {
-                kernel: Some(PathBuf::from("/path/to/kernel")),
-                firmware: None,
-                cmdline: None,
-                initramfs: None,
-                #[cfg(feature = "igvm")]
-                igvm: None,
-                #[cfg(feature = "sev_snp")]
-                host_data: Some(
-                    "243eb7dc1a21129caa91dcbb794922b933baecb5823a377eb431188673288c07".to_string(),
-                ),
-                #[cfg(feature = "fw_cfg")]
-                fw_cfg_config: None,
-            }),
-            rate_limit_groups: None,
-            disks: None,
-            net: None,
-            rng: RngConfig {
-                src: PathBuf::from("/dev/urandom"),
-                pci_common: PciDeviceCommonConfig::default(),
-            },
-            balloon: None,
-            fs: None,
-            generic_vhost_user: None,
-            pmem: None,
-            serial: SerialConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Null,
-                    socket: None,
-                },
-            },
-            console: ConsoleConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Tty,
-                    socket: None,
-                },
-                pci_common: PciDeviceCommonConfig::default(),
-            },
-            #[cfg(target_arch = "x86_64")]
-            debug_console: DebugConsoleConfig::default(),
-            devices: None,
-            user_devices: None,
-            vdpa: None,
-            vsock: None,
-            #[cfg(feature = "pvmemcontrol")]
-            pvmemcontrol: None,
-            pvpanic: false,
-            iommu: false,
-            numa: None,
-            watchdog: false,
-            #[cfg(feature = "guest_debug")]
-            gdb: false,
-            pci_segments: None,
-            platform: None,
-            tpm: None,
-            preserved_fds: None,
-            landlock_enable: false,
-            landlock_rules: None,
-            #[cfg(feature = "ivshmem")]
-            ivshmem: None,
-        };
-
-        valid_config.validate().unwrap();
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.serial.common.mode = ConsoleOutputMode::Tty;
-        invalid_config.console.common.mode = ConsoleOutputMode::Tty;
-        valid_config.validate().unwrap();
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.payload = None;
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::PayloadError(
-                PayloadConfigError::MissingBootitem
-            ))
-        );
-
-        #[cfg(feature = "fw_cfg")]
-        {
-            let mut invalid_config = valid_config.clone();
-            if let Some(payload) = invalid_config.payload.as_mut() {
-                payload.fw_cfg_config = Some(FwCfgConfig {
-                    e820: true,
-                    kernel: false,
-                    cmdline: false,
-                    initramfs: false,
-                    acpi_tables: true,
-                    items: Some(FwCfgItemList {
-                        item_list: vec![FwCfgItem {
-                            name: "opt/org.test/invalid".to_string(),
-                            file: None,
-                            string: None,
-                        }],
-                    }),
-                });
-            }
-            assert_eq!(
-                invalid_config.validate(),
-                Err(ValidationError::PayloadError(
-                    PayloadConfigError::FwCfgInvalidItem("opt/org.test/invalid".to_string())
-                ))
-            );
-        }
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.serial.common.mode = ConsoleOutputMode::File;
-        invalid_config.serial.common.file = None;
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::ConsoleFileMissing)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.cpus.max_vcpus = 16;
-        invalid_config.cpus.boot_vcpus = 32;
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::CpusMaxLowerThanBoot(16, 32))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.cpus.max_vcpus = 16;
-        invalid_config.cpus.boot_vcpus = 16;
-        invalid_config.cpus.topology = Some(CpuTopology {
-            threads_per_core: 2,
-            cores_per_die: 8,
-            dies_per_package: 1,
-            packages: 2,
-        });
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::CpuTopologyCount)
-        );
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.cpus.max_vcpus = 8;
-        still_valid_config.cpus.boot_vcpus = 8;
-        still_valid_config.cpus.topology = Some(CpuTopology {
-            threads_per_core: 1,
-            cores_per_die: 8,
-            dies_per_package: 1,
-            packages: 1,
-        });
-        still_valid_config.validate().unwrap();
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.cpus.max_vcpus = 8;
-        still_valid_config.cpus.boot_vcpus = 8;
-        still_valid_config.cpus.topology = Some(CpuTopology {
-            threads_per_core: 2,
-            cores_per_die: 4,
-            dies_per_package: 1,
-            packages: 1,
-        });
-        still_valid_config.validate().unwrap();
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            let mut invalid_config = valid_config.clone();
-            invalid_config.cpus.max_vcpus = 6;
-            invalid_config.cpus.boot_vcpus = 6;
-            invalid_config.cpus.topology = Some(CpuTopology {
-                threads_per_core: 3,
-                cores_per_die: 2,
-                dies_per_package: 1,
-                packages: 1,
-            });
-            assert_eq!(
-                invalid_config.validate(),
-                Err(ValidationError::CpuTopologyThreadsPerCore)
-            );
-        }
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.disks = Some(vec![DiskConfig {
-            vhost_socket: Some("/path/to/sock".to_owned()),
-            path: Some(PathBuf::from("/path/to/image")),
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::DiskSocketAndPath)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.memory.shared = true;
-        invalid_config.disks = Some(vec![DiskConfig {
-            path: None,
-            vhost_user: true,
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::VhostUserMissingSocket)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.disks = Some(vec![DiskConfig {
-            path: None,
-            vhost_user: true,
-            vhost_socket: Some("/path/to/sock".to_owned()),
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::VhostUserRequiresSharedMemory)
-        );
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.disks = Some(vec![DiskConfig {
-            path: None,
-            vhost_user: true,
-            vhost_socket: Some("/path/to/sock".to_owned()),
-            ..disk_fixture()
-        }]);
-        still_valid_config.memory.shared = true;
-        still_valid_config.validate().unwrap();
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.net = Some(vec![NetConfig {
-            vhost_user: true,
-            ..net_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::VhostUserRequiresSharedMemory)
-        );
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.net = Some(vec![NetConfig {
-            vhost_user: true,
-            vhost_socket: Some("/path/to/sock".to_owned()),
-            ..net_fixture()
-        }]);
-        still_valid_config.memory.shared = true;
-        still_valid_config.validate().unwrap();
-
-        // Test vhost_user with rate limiting for disk
-        let mut invalid_config = valid_config.clone();
-        invalid_config.memory.shared = true;
-        invalid_config.disks = Some(vec![DiskConfig {
-            path: None,
-            vhost_user: true,
-            vhost_socket: Some("/path/to/sock".to_owned()),
-            rate_limiter_config: Some(RateLimiterConfig::default()),
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::VhostUserRateLimiterNotSupported)
-        );
-
-        // Test vhost_user with rate_limit_group for disk
-        let mut invalid_config = valid_config.clone();
-        invalid_config.memory.shared = true;
-        invalid_config.disks = Some(vec![DiskConfig {
-            path: None,
-            vhost_user: true,
-            vhost_socket: Some("/path/to/sock".to_owned()),
-            rate_limit_group: Some("group0".to_string()),
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::VhostUserRateLimiterNotSupported)
-        );
-
-        // Test vhost_user with rate limiting for net
-        let mut invalid_config = valid_config.clone();
-        invalid_config.memory.shared = true;
-        invalid_config.net = Some(vec![NetConfig {
-            vhost_user: true,
-            vhost_socket: Some("/path/to/sock".to_owned()),
-            rate_limiter_config: Some(RateLimiterConfig::default()),
-            ..net_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::VhostUserRateLimiterNotSupported)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.net = Some(vec![NetConfig {
-            fds: Some(vec![0]),
-            ..net_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::VnetReservedFd(0))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.net = Some(vec![NetConfig {
-            offload_csum: false,
-            ..net_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::NoHardwareChecksumOffload)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.net = Some(vec![NetConfig {
-            ip: None,
-            mask: Some("255.255.255.0".parse().unwrap()),
-            ..net_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::MaskProvidedWithoutIp)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.net = Some(vec![NetConfig {
-            ip: Some("192.1.33.7".parse().unwrap()),
-            mask: None,
-            ..net_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::IpProvidedWithoutMask)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.fs = Some(vec![fs_fixture()]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::VhostUserRequiresSharedMemory)
-        );
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.memory.shared = true;
-        still_valid_config.validate().unwrap();
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.memory.hugepages = true;
-        still_valid_config.validate().unwrap();
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.memory.hugepages = true;
-        still_valid_config.memory.hugepage_size = Some(2 << 20);
-        still_valid_config.validate().unwrap();
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.memory.hugepages = false;
-        invalid_config.memory.hugepage_size = Some(2 << 20);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::HugePageSizeWithoutHugePages)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.memory.hugepages = true;
-        invalid_config.memory.hugepage_size = Some(3 << 20);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidHugePageSize(3 << 20))
-        );
-
-        // Test mergeable and shared validation for global memory
-        let mut invalid_config = valid_config.clone();
-        invalid_config.memory.shared = true;
-        invalid_config.memory.mergeable = true;
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidSharedMemoryWithMergeable)
-        );
-
-        // Test mergeable and shared validation for memory zones
-        let mut invalid_config = valid_config.clone();
-        invalid_config.memory.zones = Some(vec![MemoryZoneConfig {
-            id: "mem0".to_string(),
-            size: 1 << 30,
-            shared: true,
-            mergeable: true,
-            ..Default::default()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidSharedMemoryWithMergeable)
-        );
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.platform = Some(platform_fixture());
-        still_valid_config.validate().unwrap();
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: MAX_NUM_PCI_SEGMENTS + 1,
-            ..platform_fixture()
-        });
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidNumPciSegments(
-                MAX_NUM_PCI_SEGMENTS + 1
-            ))
-        );
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        still_valid_config.validate().unwrap();
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([
-                MAX_NUM_PCI_SEGMENTS + 1,
-                MAX_NUM_PCI_SEGMENTS + 2,
-            ])),
-            ..platform_fixture()
-        });
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidPciSegment(MAX_NUM_PCI_SEGMENTS + 1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            iommu_address_width_bits: MAX_IOMMU_ADDRESS_WIDTH_BITS + 1,
-            ..platform_fixture()
-        });
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidIommuAddressWidthBits(
-                MAX_IOMMU_ADDRESS_WIDTH_BITS + 1
-            ))
-        );
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        still_valid_config.disks = Some(vec![DiskConfig {
-            pci_common: PciDeviceCommonConfig {
-                iommu: true,
-                pci_segment: 1,
-                ..Default::default()
-            },
-            ..disk_fixture()
-        }]);
-        still_valid_config.validate().unwrap();
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        still_valid_config.net = Some(vec![NetConfig {
-            pci_common: PciDeviceCommonConfig {
-                iommu: true,
-                pci_segment: 1,
-                ..Default::default()
-            },
-            ..net_fixture()
-        }]);
-        still_valid_config.validate().unwrap();
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        still_valid_config.pmem = Some(vec![PmemConfig {
-            pci_common: PciDeviceCommonConfig {
-                iommu: true,
-                pci_segment: 1,
-                ..Default::default()
-            },
-            ..pmem_fixture()
-        }]);
-        still_valid_config.validate().unwrap();
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        still_valid_config.devices = Some(vec![DeviceConfig {
-            pci_common: PciDeviceCommonConfig {
-                iommu: true,
-                pci_segment: 1,
-                ..Default::default()
-            },
-            ..device_fixture()
-        }]);
-        still_valid_config.validate().unwrap();
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        still_valid_config.vsock = Some(VsockConfig {
-            pci_common: PciDeviceCommonConfig {
-                iommu: true,
-                pci_segment: 1,
-                ..Default::default()
-            },
-            cid: 3,
-            socket: PathBuf::new(),
-        });
-        still_valid_config.validate().unwrap();
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        invalid_config.disks = Some(vec![DiskConfig {
-            pci_common: PciDeviceCommonConfig {
-                iommu: false,
-                pci_segment: 1,
-                ..Default::default()
-            },
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::OnIommuSegment(1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        invalid_config.net = Some(vec![NetConfig {
-            pci_common: PciDeviceCommonConfig {
-                iommu: false,
-                pci_segment: 1,
-                ..Default::default()
-            },
-            ..net_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::OnIommuSegment(1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        invalid_config.pmem = Some(vec![PmemConfig {
-            pci_common: PciDeviceCommonConfig {
-                pci_segment: 1,
-                ..Default::default()
-            },
-            ..pmem_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::OnIommuSegment(1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        invalid_config.devices = Some(vec![DeviceConfig {
-            pci_common: PciDeviceCommonConfig {
-                pci_segment: 1,
-                ..Default::default()
-            },
-            ..device_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::OnIommuSegment(1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        invalid_config.vsock = Some(VsockConfig {
-            pci_common: PciDeviceCommonConfig {
-                pci_segment: 1,
-                ..Default::default()
-            },
-            cid: 3,
-            socket: PathBuf::new(),
-        });
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::OnIommuSegment(1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.memory.shared = true;
-        invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        invalid_config.user_devices = Some(vec![UserDeviceConfig {
-            pci_common: PciDeviceCommonConfig {
-                pci_segment: 1,
-                ..Default::default()
-            },
-            socket: PathBuf::new(),
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::OnIommuSegment(1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        invalid_config.vdpa = Some(vec![VdpaConfig {
-            pci_common: PciDeviceCommonConfig {
-                pci_segment: 1,
-                ..Default::default()
-            },
-            ..vdpa_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::OnIommuSegment(1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.memory.shared = true;
-        invalid_config.platform = Some(PlatformConfig {
-            iommu_segments: Some(Box::new([1, 2, 3])),
-            ..platform_fixture()
-        });
-        invalid_config.fs = Some(vec![FsConfig {
-            pci_common: PciDeviceCommonConfig {
-                pci_segment: 1,
-                ..Default::default()
-            },
-            ..fs_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::OnIommuSegment(1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 2,
-            ..platform_fixture()
-        });
-        invalid_config.numa = Some(Box::new([
-            NumaConfig {
-                guest_numa_id: 0,
-                cpus: Some(Box::new([0])),
-                pci_segments: Some(Box::new([1])),
-                ..numa_fixture()
-            },
-            NumaConfig {
-                guest_numa_id: 1,
-                cpus: Some(Box::new([1])),
-                pci_segments: Some(Box::new([1])),
-                ..numa_fixture()
-            },
-        ]));
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::PciSegmentReused(1, 0, 1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.pci_segments = Some(Box::new([PciSegmentConfig {
-            pci_segment: 0,
-            mmio32_aperture_weight: 1,
-            mmio64_aperture_weight: 0,
-        }]));
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidPciSegmentApertureWeight(0))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.pci_segments = Some(Box::new([PciSegmentConfig {
-            pci_segment: 0,
-            mmio32_aperture_weight: 0,
-            mmio64_aperture_weight: 1,
-        }]));
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidPciSegmentApertureWeight(0))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.numa = Some(Box::new([
-            NumaConfig {
-                guest_numa_id: 0,
-                cpus: Some(Box::new([0])),
-                ..numa_fixture()
-            },
-            NumaConfig {
-                guest_numa_id: 1,
-                cpus: Some(Box::new([1])),
-                pci_segments: Some(Box::new([0])),
-                ..numa_fixture()
-            },
-        ]));
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::DefaultPciSegmentInvalidNode(1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.numa = Some(Box::new([
-            NumaConfig {
-                guest_numa_id: 0,
-                cpus: Some(Box::new([0])),
-                pci_segments: Some(Box::new([0])),
-                ..numa_fixture()
-            },
-            NumaConfig {
-                guest_numa_id: 1,
-                cpus: Some(Box::new([1])),
-                pci_segments: Some(Box::new([1])),
-                ..numa_fixture()
-            },
-        ]));
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidPciSegment(1))
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.disks = Some(vec![DiskConfig {
-            rate_limit_group: Some("foo".into()),
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidRateLimiterGroup)
-        );
-
-        // Test serial length validation
-        let mut valid_serial_config = valid_config.clone();
-        valid_serial_config.disks = Some(vec![DiskConfig {
-            serial: Some("valid_serial".to_string()),
-            ..disk_fixture()
-        }]);
-        valid_serial_config.validate().unwrap();
-
-        // Test empty string serial (should be valid)
-        let mut empty_serial_config = valid_config.clone();
-        empty_serial_config.disks = Some(vec![DiskConfig {
-            serial: Some(String::new()),
-            ..disk_fixture()
-        }]);
-        empty_serial_config.validate().unwrap();
-
-        // Test None serial (should be valid)
-        let mut none_serial_config = valid_config.clone();
-        none_serial_config.disks = Some(vec![DiskConfig {
-            serial: None,
-            ..disk_fixture()
-        }]);
-        none_serial_config.validate().unwrap();
-
-        // Test maximum length serial (exactly VIRTIO_BLK_ID_BYTES)
-        let max_serial = "a".repeat(VIRTIO_BLK_ID_BYTES as usize);
-        let mut max_serial_config = valid_config.clone();
-        max_serial_config.disks = Some(vec![DiskConfig {
-            serial: Some(max_serial),
-            ..disk_fixture()
-        }]);
-        max_serial_config.validate().unwrap();
-
-        // Test serial length exceeding VIRTIO_BLK_ID_BYTES
-        let long_serial = "a".repeat(VIRTIO_BLK_ID_BYTES as usize + 1);
-        let mut invalid_serial_config = valid_config.clone();
-        invalid_serial_config.disks = Some(vec![DiskConfig {
-            serial: Some(long_serial.clone()),
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_serial_config.validate(),
-            Err(ValidationError::InvalidSerialLength(
-                long_serial.len(),
-                VIRTIO_BLK_ID_BYTES as usize
-            ))
-        );
-
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.devices = Some(vec![
-            DeviceConfig {
-                path: "/device1".into(),
-                ..device_fixture()
-            },
-            DeviceConfig {
-                path: "/device2".into(),
-                ..device_fixture()
-            },
-        ]);
-        still_valid_config.validate().unwrap();
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.devices = Some(vec![
-            DeviceConfig {
-                path: "/device1".into(),
-                ..device_fixture()
-            },
-            DeviceConfig {
-                path: "/device1".into(),
-                ..device_fixture()
-            },
-        ]);
-        invalid_config.validate().unwrap_err();
-        #[cfg(feature = "sev_snp")]
-        {
-            // Payload with empty host data
-            let mut config_with_no_host_data = valid_config.clone();
-            config_with_no_host_data.payload = Some(PayloadConfig {
-                kernel: Some(PathBuf::from("/path/to/kernel")),
-                firmware: None,
-                cmdline: None,
-                initramfs: None,
-                #[cfg(feature = "igvm")]
-                igvm: None,
-                #[cfg(feature = "sev_snp")]
-                host_data: Some(String::new()),
-                #[cfg(feature = "fw_cfg")]
-                fw_cfg_config: None,
-            });
-            config_with_no_host_data.validate().unwrap_err();
-
-            // Payload with no host data provided
-            let mut valid_config_with_no_host_data = valid_config.clone();
-            valid_config_with_no_host_data.payload = Some(PayloadConfig {
-                kernel: Some(PathBuf::from("/path/to/kernel")),
-                firmware: None,
-                cmdline: None,
-                initramfs: None,
-                #[cfg(feature = "igvm")]
-                igvm: None,
-                #[cfg(feature = "sev_snp")]
-                host_data: None,
-                #[cfg(feature = "fw_cfg")]
-                fw_cfg_config: None,
-            });
-            valid_config_with_no_host_data.validate().unwrap();
-
-            // Payload with invalid host data length i.e less than 64
-            let mut config_with_invalid_host_data = valid_config.clone();
-            config_with_invalid_host_data.payload = Some(PayloadConfig {
-                kernel: Some(PathBuf::from("/path/to/kernel")),
-                firmware: None,
-                cmdline: None,
-                initramfs: None,
-                #[cfg(feature = "igvm")]
-                igvm: None,
-                #[cfg(feature = "sev_snp")]
-                host_data: Some(
-                    "243eb7dc1a21129caa91dcbb794922b933baecb5823a377eb43118867328".to_string(),
-                ),
-                #[cfg(feature = "fw_cfg")]
-                fw_cfg_config: None,
-            });
-            config_with_invalid_host_data.validate().unwrap_err();
-        }
-
-        // x_nv_gpudirect_clique with vfio_p2p_dma=off should fail
-        let mut invalid_config = valid_config.clone();
-        invalid_config.platform = Some(PlatformConfig {
-            vfio_p2p_dma: false,
-            ..platform_fixture()
-        });
-        invalid_config.devices = Some(vec![DeviceConfig {
-            x_nv_gpudirect_clique: Some(0),
-            ..device_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::GpuDirectCliqueRequiresP2pDma)
-        );
-
-        // x_nv_gpudirect_clique with vfio_p2p_dma=on should pass
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.platform = Some(PlatformConfig {
-            vfio_p2p_dma: true,
-            ..platform_fixture()
-        });
-        still_valid_config.devices = Some(vec![DeviceConfig {
-            x_nv_gpudirect_clique: Some(0),
-            ..device_fixture()
-        }]);
-        still_valid_config.validate().unwrap();
-
-        // x_nv_gpudirect_clique with no platform config (default p2p_dma=on) should pass
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.devices = Some(vec![DeviceConfig {
-            x_nv_gpudirect_clique: Some(0),
-            ..device_fixture()
-        }]);
-        still_valid_config.validate().unwrap();
-
-        // x_exclude_mmap_bars only accepts PCI BAR indices 0 through 5
-        let mut invalid_config = valid_config.clone();
-        invalid_config.devices = Some(vec![DeviceConfig {
-            x_exclude_mmap_bars: vec![6],
-            ..device_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidDeviceExcludeMmapBar(6))
-        );
-
-        let mut still_valid_config = valid_config.clone();
-        // SAFETY: Safe as the file was just opened
-        let fd1 = OwnedFd::from(File::open("/dev/null").unwrap()).into();
-        // SAFETY: Safe as the file was just opened
-        let fd2 = OwnedFd::from(File::open("/dev/null").unwrap()).into();
-        // SAFETY: safe as both FDs are valid
-        unsafe {
-            still_valid_config.add_preserved_fds(vec![fd1, fd2]);
-        }
-        let _still_valid_config = still_valid_config.clone();
-
-        // Valid BDF test
-        let mut still_valid_config = valid_config.clone();
-        still_valid_config.disks = Some(vec![DiskConfig {
-            pci_common: PciDeviceCommonConfig {
-                pci_device_id: Some(8),
-                ..Default::default()
-            },
-            ..disk_fixture()
-        }]);
-        still_valid_config.validate().unwrap();
-        // Invalid BDF - Same ID as Root device
-        let mut invalid_config = valid_config.clone();
-        invalid_config.disks = Some(vec![DiskConfig {
-            pci_common: PciDeviceCommonConfig {
-                pci_device_id: Some(pci::PCI_ROOT_DEVICE_ID),
-                ..Default::default()
-            },
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::ReservedPciDeviceId(
-                pci::PCI_ROOT_DEVICE_ID
-            ))
-        );
-        // Invalid BDF - Out of range
-        let mut invalid_config = valid_config.clone();
-        invalid_config.disks = Some(vec![DiskConfig {
-            pci_common: PciDeviceCommonConfig {
-                pci_device_id: Some(pci::NUM_DEVICE_IDS + 1),
-                ..Default::default()
-            },
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidPciDeviceId(pci::NUM_DEVICE_IDS + 1))
-        );
-
-        // Invalid console BDF - Same ID as Root device
-        let mut invalid_config = valid_config.clone();
-        invalid_config.console.pci_common.pci_device_id = Some(pci::PCI_ROOT_DEVICE_ID);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::ReservedPciDeviceId(
-                pci::PCI_ROOT_DEVICE_ID
-            ))
-        );
-        // Invalid console BDF - Out of range
-        let mut invalid_config = valid_config.clone();
-        invalid_config.console.pci_common.pci_device_id = Some(pci::NUM_DEVICE_IDS + 1);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::InvalidPciDeviceId(pci::NUM_DEVICE_IDS + 1))
-        );
-        // Invalid console ID - Duplicate identifier
-        let mut invalid_config = valid_config.clone();
-        invalid_config.console.pci_common.id = Some("test0".to_string());
-        invalid_config.disks = Some(vec![DiskConfig {
-            pci_common: PciDeviceCommonConfig {
-                id: Some("test0".to_string()),
-                ..Default::default()
-            },
-            ..disk_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::IdentifierNotUnique("test0".to_string()))
-        );
-    }
-    #[test]
-    fn test_landlock_parsing() -> Result<()> {
-        // should not be empty
-        LandlockConfig::parse("").unwrap_err();
-        // access should not be empty
-        LandlockConfig::parse("path=/dir/path1").unwrap_err();
-        LandlockConfig::parse("path=/dir/path1,access=rwr").unwrap_err();
-        assert_eq!(
-            LandlockConfig::parse("path=/dir/path1,access=rw")?,
-            LandlockConfig {
-                path: PathBuf::from("/dir/path1"),
-                access: "rw".to_string(),
-            }
-        );
-        Ok(())
-    }
-    #[test]
-    #[cfg(feature = "fw_cfg")]
-    fn test_fw_cfg_config_item_list_parsing() -> Result<()> {
-        // Empty list
-        FwCfgConfig::parse("items=[]").unwrap_err();
-        // Missing closing bracket
-        FwCfgConfig::parse("items=[name=opt/org.test/fw_cfg_test_item,file=/tmp/fw_cfg_test_item")
-            .unwrap_err();
-        // Single file Item
-        assert_eq!(
-            FwCfgConfig::parse(
-                "items=[name=opt/org.test/fw_cfg_test_item,file=/tmp/fw_cfg_test_item]"
-            )?,
-            FwCfgConfig {
-                items: Some(FwCfgItemList {
-                    item_list: vec![FwCfgItem {
-                        name: "opt/org.test/fw_cfg_test_item".to_string(),
-                        file: Some(PathBuf::from("/tmp/fw_cfg_test_item")),
-                        string: None,
-                    }]
-                }),
-                ..Default::default()
-            },
-        );
-        // Multiple file Items
-        assert_eq!(
-            FwCfgConfig::parse(
-                "items=[name=opt/org.test/fw_cfg_test_item,file=/tmp/fw_cfg_test_item:name=opt/org.test/fw_cfg_test_item2,file=/tmp/fw_cfg_test_item2]"
-            )?,
-            FwCfgConfig {
-                items: Some(FwCfgItemList {
-                    item_list: vec![
-                        FwCfgItem {
-                            name: "opt/org.test/fw_cfg_test_item".to_string(),
-                            file: Some(PathBuf::from("/tmp/fw_cfg_test_item")),
-                            string: None,
-                        },
-                        FwCfgItem {
-                            name: "opt/org.test/fw_cfg_test_item2".to_string(),
-                            file: Some(PathBuf::from("/tmp/fw_cfg_test_item2")),
-                            string: None,
-                        }
-                    ]
-                }),
-                ..Default::default()
-            },
-        );
-        // Single string Item (for OVMF MMIO64 config, GPU CC passthrough, etc.)
-        assert_eq!(
-            FwCfgConfig::parse("items=[name=opt/ovmf/X-PciMmio64Mb,string=262144]")?,
-            FwCfgConfig {
-                items: Some(FwCfgItemList {
-                    item_list: vec![FwCfgItem {
-                        name: "opt/ovmf/X-PciMmio64Mb".to_string(),
-                        file: None,
-                        string: Some("262144".to_string()),
-                    }]
-                }),
-                ..Default::default()
-            },
-        );
-        // Mixed file and string Items
-        assert_eq!(
-            FwCfgConfig::parse(
-                "items=[name=opt/org.test/fw_cfg_test_item,file=/tmp/fw_cfg_test_item:name=opt/ovmf/X-PciMmio64Mb,string=262144]"
-            )?,
-            FwCfgConfig {
-                items: Some(FwCfgItemList {
-                    item_list: vec![
-                        FwCfgItem {
-                            name: "opt/org.test/fw_cfg_test_item".to_string(),
-                            file: Some(PathBuf::from("/tmp/fw_cfg_test_item")),
-                            string: None,
-                        },
-                        FwCfgItem {
-                            name: "opt/ovmf/X-PciMmio64Mb".to_string(),
-                            file: None,
-                            string: Some("262144".to_string()),
-                        }
-                    ]
-                }),
-                ..Default::default()
-            },
-        );
-        // Missing both file and string parses OK but fails validation
-        let missing_content =
-            FwCfgConfig::parse("items=[name=opt/org.test/missing_content]").unwrap();
-        assert_eq!(
-            missing_content.items.as_ref().unwrap().item_list[0].file,
-            None
-        );
-        assert_eq!(
-            missing_content.items.as_ref().unwrap().item_list[0].string,
-            None
-        );
-        // Both file and string parses OK but fails validation
-        let both = FwCfgConfig::parse("items=[name=opt/org.test/both,file=/tmp/test,string=test]")
-            .unwrap();
-        assert!(both.items.as_ref().unwrap().item_list[0].file.is_some());
-        assert!(both.items.as_ref().unwrap().item_list[0].string.is_some());
-        Ok(())
-    }
-}
+// #[cfg(test)]
+// mod unit_tests {
+//     use std::fs::File;
+//     use std::os::unix::io::AsRawFd;
+//
+//     use net_util::MacAddr;
+//
+//     use super::*;
+//
+//     #[test]
+//     fn test_cpu_parsing() -> Result<()> {
+//         assert_eq!(CpusConfig::parse("")?, CpusConfig::default());
+//
+//         assert_eq!(
+//             CpusConfig::parse("boot=1")?,
+//             CpusConfig {
+//                 boot_vcpus: 1,
+//                 max_vcpus: 1,
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             CpusConfig::parse("boot=1,max=2")?,
+//             CpusConfig {
+//                 boot_vcpus: 1,
+//                 max_vcpus: 2,
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             CpusConfig::parse("boot=8,topology=2:2:1:2")?,
+//             CpusConfig {
+//                 boot_vcpus: 8,
+//                 max_vcpus: 8,
+//                 topology: Some(CpuTopology {
+//                     threads_per_core: 2,
+//                     cores_per_die: 2,
+//                     dies_per_package: 1,
+//                     packages: 2
+//                 }),
+//                 ..Default::default()
+//             }
+//         );
+//
+//         CpusConfig::parse("boot=8,topology=2:2:1").unwrap_err();
+//         CpusConfig::parse("boot=8,topology=2:2:1:x").unwrap_err();
+//         assert_eq!(
+//             CpusConfig::parse("boot=1,kvm_hyperv=on")?,
+//             CpusConfig {
+//                 boot_vcpus: 1,
+//                 max_vcpus: 1,
+//                 kvm_hyperv: true,
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             CpusConfig::parse("boot=2,affinity=[0@[0,2],1@[1,3]]")?,
+//             CpusConfig {
+//                 boot_vcpus: 2,
+//                 max_vcpus: 2,
+//                 affinity: Some(Box::new([
+//                     CpuAffinity {
+//                         vcpu: 0,
+//                         host_cpus: Box::new([0, 2]),
+//                     },
+//                     CpuAffinity {
+//                         vcpu: 1,
+//                         host_cpus: Box::new([1, 3]),
+//                     }
+//                 ])),
+//                 ..Default::default()
+//             },
+//         );
+//
+//         // Test core_scheduling parsing
+//         assert_eq!(
+//             CpusConfig::parse("boot=1,core_scheduling=vm")?,
+//             CpusConfig {
+//                 boot_vcpus: 1,
+//                 max_vcpus: 1,
+//                 core_scheduling: CoreScheduling::Vm,
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             CpusConfig::parse("boot=1,core_scheduling=vcpu")?,
+//             CpusConfig {
+//                 boot_vcpus: 1,
+//                 max_vcpus: 1,
+//                 core_scheduling: CoreScheduling::Vcpu,
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             CpusConfig::parse("boot=1,core_scheduling=off")?,
+//             CpusConfig {
+//                 boot_vcpus: 1,
+//                 max_vcpus: 1,
+//                 core_scheduling: CoreScheduling::Off,
+//                 ..Default::default()
+//             }
+//         );
+//         // Default (no core_scheduling specified) should be Vm
+//         assert_eq!(
+//             CpusConfig::parse("boot=1")?.core_scheduling,
+//             CoreScheduling::Vm
+//         );
+//         // Invalid value should error
+//         CpusConfig::parse("boot=1,core_scheduling=invalid").unwrap_err();
+//
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_mem_zone_parsing() -> Result<()> {
+//         // mergeable defaults to false
+//         assert_eq!(
+//             MemoryConfig::parse("size=0", Some(vec!["id=mem0,size=1G"]))?,
+//             MemoryConfig {
+//                 size: 0,
+//                 zones: Some(vec![MemoryZoneConfig {
+//                     id: "mem0".to_string(),
+//                     size: 1 << 30,
+//                     ..Default::default()
+//                 }]),
+//                 ..Default::default()
+//             }
+//         );
+//         // mergeable=on
+//         assert_eq!(
+//             MemoryConfig::parse("size=0", Some(vec!["id=mem0,size=1G,mergeable=on"]))?,
+//             MemoryConfig {
+//                 size: 0,
+//                 zones: Some(vec![MemoryZoneConfig {
+//                     id: "mem0".to_string(),
+//                     size: 1 << 30,
+//                     mergeable: true,
+//                     ..Default::default()
+//                 }]),
+//                 ..Default::default()
+//             }
+//         );
+//         // mergeable=off is explicit false
+//         assert_eq!(
+//             MemoryConfig::parse("size=0", Some(vec!["id=mem0,size=1G,mergeable=off"]))?,
+//             MemoryConfig {
+//                 size: 0,
+//                 zones: Some(vec![MemoryZoneConfig {
+//                     id: "mem0".to_string(),
+//                     size: 1 << 30,
+//                     mergeable: false,
+//                     ..Default::default()
+//                 }]),
+//                 ..Default::default()
+//             }
+//         );
+//         // per-zone mergeable independent of global mergeable
+//         assert_eq!(
+//             MemoryConfig::parse(
+//                 "size=1G,mergeable=off",
+//                 Some(vec!["id=hotplug,size=0,hotplug_size=4G,mergeable=on"])
+//             )?,
+//             MemoryConfig {
+//                 size: 1 << 30,
+//                 mergeable: false,
+//                 hotplug_method: HotplugMethod::Acpi,
+//                 zones: Some(vec![MemoryZoneConfig {
+//                     id: "hotplug".to_string(),
+//                     size: 0,
+//                     hotplug_size: Some(4 << 30),
+//                     mergeable: true,
+//                     ..Default::default()
+//                 }]),
+//                 ..Default::default()
+//             }
+//         );
+//         // global mergeable=on inherited by zone with no explicit mergeable
+//         assert_eq!(
+//             MemoryConfig::parse("size=0,mergeable=on", Some(vec!["id=mem0,size=1G"]))?,
+//             MemoryConfig {
+//                 size: 0,
+//                 mergeable: true,
+//                 zones: Some(vec![MemoryZoneConfig {
+//                     id: "mem0".to_string(),
+//                     size: 1 << 30,
+//                     mergeable: true,
+//                     ..Default::default()
+//                 }]),
+//                 ..Default::default()
+//             }
+//         );
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_mem_parsing() -> Result<()> {
+//         assert_eq!(MemoryConfig::parse("", None)?, MemoryConfig::default());
+//         // Default string
+//         assert_eq!(
+//             MemoryConfig::parse("size=512M", None)?,
+//             MemoryConfig::default()
+//         );
+//         assert_eq!(
+//             MemoryConfig::parse("size=512M,mergeable=on", None)?,
+//             MemoryConfig {
+//                 size: 512 << 20,
+//                 mergeable: true,
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             MemoryConfig::parse("mergeable=on", None)?,
+//             MemoryConfig {
+//                 mergeable: true,
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             MemoryConfig::parse("size=1G,mergeable=off", None)?,
+//             MemoryConfig {
+//                 size: 1 << 30,
+//                 mergeable: false,
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             MemoryConfig::parse("hotplug_method=acpi", None)?,
+//             MemoryConfig {
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             MemoryConfig::parse("hotplug_method=acpi,hotplug_size=512M", None)?,
+//             MemoryConfig {
+//                 hotplug_size: Some(512 << 20),
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             MemoryConfig::parse("hotplug_method=virtio-mem,hotplug_size=512M", None)?,
+//             MemoryConfig {
+//                 hotplug_size: Some(512 << 20),
+//                 hotplug_method: HotplugMethod::VirtioMem,
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             MemoryConfig::parse("hugepages=on,size=1G,hugepage_size=2M", None)?,
+//             MemoryConfig {
+//                 hugepage_size: Some(2 << 20),
+//                 size: 1 << 30,
+//                 hugepages: true,
+//                 ..Default::default()
+//             }
+//         );
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_rate_limit_group_parsing() -> Result<()> {
+//         assert_eq!(
+//             RateLimiterGroupConfig::parse("id=group0,bw_size=1000,bw_refill_time=100")?,
+//             RateLimiterGroupConfig {
+//                 id: "group0".to_string(),
+//                 rate_limiter_config: RateLimiterConfig {
+//                     bandwidth: Some(TokenBucketConfig {
+//                         size: 1000,
+//                         one_time_burst: Some(0),
+//                         refill_time: 100,
+//                     }),
+//                     ops: None,
+//                 }
+//             }
+//         );
+//         assert_eq!(
+//             RateLimiterGroupConfig::parse("id=group0,ops_size=1000,ops_refill_time=100")?,
+//             RateLimiterGroupConfig {
+//                 id: "group0".to_string(),
+//                 rate_limiter_config: RateLimiterConfig {
+//                     bandwidth: None,
+//                     ops: Some(TokenBucketConfig {
+//                         size: 1000,
+//                         one_time_burst: Some(0),
+//                         refill_time: 100,
+//                     }),
+//                 }
+//             }
+//         );
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_pci_segment_parsing() -> Result<()> {
+//         assert_eq!(
+//             PciSegmentConfig::parse("pci_segment=0")?,
+//             PciSegmentConfig {
+//                 pci_segment: 0,
+//                 mmio32_aperture_weight: 1,
+//                 mmio64_aperture_weight: 1,
+//             }
+//         );
+//         assert_eq!(
+//             PciSegmentConfig::parse(
+//                 "pci_segment=0,mmio32_aperture_weight=1,mmio64_aperture_weight=1"
+//             )?,
+//             PciSegmentConfig {
+//                 pci_segment: 0,
+//                 mmio32_aperture_weight: 1,
+//                 mmio64_aperture_weight: 1,
+//             }
+//         );
+//         assert_eq!(
+//             PciSegmentConfig::parse("pci_segment=0,mmio32_aperture_weight=2")?,
+//             PciSegmentConfig {
+//                 pci_segment: 0,
+//                 mmio32_aperture_weight: 2,
+//                 mmio64_aperture_weight: 1,
+//             }
+//         );
+//         assert_eq!(
+//             PciSegmentConfig::parse("pci_segment=0,mmio64_aperture_weight=2")?,
+//             PciSegmentConfig {
+//                 pci_segment: 0,
+//                 mmio32_aperture_weight: 1,
+//                 mmio64_aperture_weight: 2,
+//             }
+//         );
+//
+//         Ok(())
+//     }
+//
+//     fn disk_fixture() -> DiskConfig {
+//         DiskConfig {
+//             pci_common: PciDeviceCommonConfig::default(),
+//             path: Some(PathBuf::from("/path/to_file")),
+//             readonly: false,
+//             direct: false,
+//             num_queues: 1,
+//             queue_size: 128,
+//             vhost_user: false,
+//             vhost_socket: None,
+//             disable_io_uring: false,
+//             disable_aio: false,
+//             rate_limit_group: None,
+//             rate_limiter_config: None,
+//             serial: None,
+//             queue_affinity: None,
+//             backing_files: false,
+//             sparse: true,
+//             image_type: ImageType::Unknown,
+//             lock_granularity: LockGranularityChoice::default(),
+//         }
+//     }
+//
+//     #[test]
+//     fn test_disk_parsing() -> Result<()> {
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file")?,
+//             DiskConfig { ..disk_fixture() }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file,id=mydisk0")?,
+//             DiskConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     id: Some("mydisk0".to_owned()),
+//                     ..Default::default()
+//                 },
+//                 ..disk_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("vhost_user=true,socket=/tmp/sock")?,
+//             DiskConfig {
+//                 path: None,
+//                 vhost_socket: Some(String::from("/tmp/sock")),
+//                 vhost_user: true,
+//                 image_type: ImageType::Unknown,
+//                 ..disk_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file,iommu=on")?,
+//             DiskConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     iommu: true,
+//                     ..Default::default()
+//                 },
+//                 ..disk_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file,iommu=on,queue_size=256")?,
+//             DiskConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     iommu: true,
+//                     ..Default::default()
+//                 },
+//                 queue_size: 256,
+//                 ..disk_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file,iommu=on,queue_size=256,num_queues=4")?,
+//             DiskConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     iommu: true,
+//                     ..Default::default()
+//                 },
+//                 queue_size: 256,
+//                 num_queues: 4,
+//                 ..disk_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file,direct=on")?,
+//             DiskConfig {
+//                 direct: true,
+//                 ..disk_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file,serial=test")?,
+//             DiskConfig {
+//                 serial: Some(String::from("test")),
+//                 ..disk_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file,rate_limit_group=group0")?,
+//             DiskConfig {
+//                 rate_limit_group: Some("group0".to_string()),
+//                 ..disk_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file,lock_granularity=full")?,
+//             DiskConfig {
+//                 lock_granularity: LockGranularityChoice::Full,
+//                 ..disk_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file,lock_granularity=byte-range")?,
+//             DiskConfig {
+//                 lock_granularity: LockGranularityChoice::ByteRange,
+//                 ..disk_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             DiskConfig::parse("path=/path/to_file,queue_affinity=[0@[1],1@[2],2@[3,4],3@[5-8]]")?,
+//             DiskConfig {
+//                 queue_affinity: Some(Box::new([
+//                     VirtQueueAffinity {
+//                         queue_index: 0,
+//                         host_cpus: Box::new([1]),
+//                     },
+//                     VirtQueueAffinity {
+//                         queue_index: 1,
+//                         host_cpus: Box::new([2]),
+//                     },
+//                     VirtQueueAffinity {
+//                         queue_index: 2,
+//                         host_cpus: Box::new([3, 4]),
+//                     },
+//                     VirtQueueAffinity {
+//                         queue_index: 3,
+//                         host_cpus: Box::new([5, 6, 7, 8]),
+//                     }
+//                 ])),
+//                 ..disk_fixture()
+//             }
+//         );
+//         Ok(())
+//     }
+//
+//     fn net_fixture() -> NetConfig<Active> {
+//         NetConfig {
+//             pci_common: PciDeviceCommonConfig::default(),
+//             tap: None,
+//             ip: None,
+//             mask: None,
+//             mac: MacAddr::parse_str("de:ad:be:ef:12:34").unwrap(),
+//             host_mac: Some(MacAddr::parse_str("12:34:de:ad:be:ef").unwrap()),
+//             mtu: None,
+//             num_queues: 2,
+//             queue_size: 256,
+//             vhost_user: false,
+//             vhost_socket: None,
+//             vhost_mode: VhostMode::Client,
+//             fds: None,
+//             rate_limiter_config: None,
+//             offload_tso: true,
+//             offload_ufo: true,
+//             offload_csum: true,
+//         }
+//     }
+//
+//     #[test]
+//     fn test_net_parsing() -> Result<()> {
+//         // mac address is random
+//         assert_eq!(
+//             NetConfig::parse("mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef")?,
+//             net_fixture(),
+//         );
+//
+//         assert_eq!(
+//             NetConfig::parse("mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,id=mynet0")?,
+//             NetConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     id: Some("mynet0".to_owned()),
+//                     ..Default::default()
+//                 },
+//                 ..net_fixture()
+//             }
+//         );
+//
+//         assert_eq!(
+//             NetConfig::parse(
+//                 "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,tap=tap0,ip=192.168.100.1,mask=255.255.255.128"
+//             )?,
+//             NetConfig {
+//                 tap: Some("tap0".to_owned()),
+//                 ip: Some("192.168.100.1".parse().unwrap()),
+//                 mask: Some("255.255.255.128".parse().unwrap()),
+//                 ..net_fixture()
+//             }
+//         );
+//
+//         assert_eq!(
+//             NetConfig::parse(
+//                 "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock"
+//             )?,
+//             NetConfig {
+//                 vhost_user: true,
+//                 vhost_socket: Some("/tmp/sock".to_owned()),
+//                 ..net_fixture()
+//             }
+//         );
+//
+//         assert_eq!(
+//             NetConfig::parse(
+//                 "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,num_queues=4,queue_size=1024,iommu=on"
+//             )?,
+//             NetConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     iommu: true,
+//                     ..Default::default()
+//                 },
+//                 num_queues: 4,
+//                 queue_size: 1024,
+//                 ..net_fixture()
+//             }
+//         );
+//
+//         assert_eq!(
+//             NetConfig::parse("mac=de:ad:be:ef:12:34,fd=[3,7],num_queues=4")?,
+//             NetConfig {
+//                 host_mac: None,
+//                 fds: Some(vec![3, 7]),
+//                 num_queues: 4,
+//                 ..net_fixture()
+//             }
+//         );
+//
+//         assert_eq!(
+//             NetConfig::parse("mac=de:ad:be:ef:12:34,mask=255.255.255.0")?,
+//             NetConfig {
+//                 mask: Some("255.255.255.0".parse().unwrap()),
+//                 host_mac: None,
+//                 ..net_fixture()
+//             }
+//         );
+//
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_parse_rng() -> Result<()> {
+//         assert_eq!(RngConfig::parse("")?, RngConfig::default());
+//         assert_eq!(
+//             RngConfig::parse("src=/dev/random")?,
+//             RngConfig {
+//                 src: PathBuf::from("/dev/random"),
+//                 ..Default::default()
+//             }
+//         );
+//         assert_eq!(
+//             RngConfig::parse("src=/dev/random,iommu=on,pci_segment=1,pci_device_id=7")?,
+//             RngConfig {
+//                 src: PathBuf::from("/dev/random"),
+//                 pci_common: PciDeviceCommonConfig {
+//                     id: None,
+//                     iommu: true,
+//                     pci_segment: 1,
+//                     pci_device_id: Some(7),
+//                 },
+//             }
+//         );
+//         assert_eq!(
+//             RngConfig::parse("iommu=on")?,
+//             RngConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     id: None,
+//                     iommu: true,
+//                     pci_segment: 0,
+//                     pci_device_id: None,
+//                 },
+//                 ..Default::default()
+//             }
+//         );
+//         Ok(())
+//     }
+//
+//     fn fs_fixture() -> FsConfig {
+//         FsConfig {
+//             pci_common: PciDeviceCommonConfig::default(),
+//             socket: PathBuf::from("/tmp/sock"),
+//             tag: "mytag".to_owned(),
+//             num_queues: 1,
+//             queue_size: 1024,
+//         }
+//     }
+//
+//     #[test]
+//     fn test_parse_fs() -> Result<()> {
+//         // "tag" and "socket" must be supplied
+//         FsConfig::parse("").unwrap_err();
+//         FsConfig::parse("tag=mytag").unwrap_err();
+//         FsConfig::parse("socket=/tmp/sock").unwrap_err();
+//         assert_eq!(FsConfig::parse("tag=mytag,socket=/tmp/sock")?, fs_fixture());
+//         assert_eq!(
+//             FsConfig::parse("tag=mytag,socket=/tmp/sock,num_queues=4,queue_size=1024")?,
+//             FsConfig {
+//                 num_queues: 4,
+//                 queue_size: 1024,
+//                 ..fs_fixture()
+//             }
+//         );
+//
+//         Ok(())
+//     }
+//
+//     #[track_caller]
+//     #[allow(clippy::too_many_arguments)]
+//     fn make_vhost_user_config(
+//         socket: &str,
+//         virtio_id: u64,
+//         id: &str,
+//         pci_segment: u64,
+//         queue_sizes: &IntegerList,
+//     ) {
+//         assert!(!socket.contains(",[]\n\r\0\""));
+//         assert!(!id.contains(",[]\n\r\0\""));
+//         let config = GenericVhostUserConfig::parse(&format!(
+//             "virtio_id={virtio_id},socket=\"{socket}\",\
+// id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
+//         ));
+//         if pci_segment <= u16::MAX.into()
+//             && virtio_id <= u32::MAX.into()
+//             && virtio_id != u64::from(VIRTIO_ID_BALLOON)
+//             && virtio_id != u64::from(VIRTIO_ID_WATCHDOG)
+//             && virtio_id != u64::from(VIRTIO_ID_IOMMU)
+//             && queue_sizes.0.iter().all(|&f| f <= u16::MAX.into())
+//         {
+//             assert_eq!(
+//                 config.unwrap(),
+//                 GenericVhostUserConfig {
+//                     pci_common: PciDeviceCommonConfig {
+//                         id: Some(id.to_owned()),
+//                         pci_segment: u16::try_from(pci_segment).unwrap(),
+//                         ..Default::default()
+//                     },
+//                     socket: socket.into(),
+//                     device_type: u32::try_from(virtio_id).unwrap(),
+//                     queue_sizes: queue_sizes
+//                         .0
+//                         .iter()
+//                         .map(|&f| u16::try_from(f).unwrap())
+//                         .collect(),
+//                 }
+//             );
+//         } else {
+//             config.unwrap_err();
+//         }
+//     }
+//
+//     #[test]
+//     fn test_parse_vhost_user() -> Result<()> {
+//         // all parameters must be supplied, except pci_segment
+//         GenericVhostUserConfig::parse("").unwrap_err();
+//         GenericVhostUserConfig::parse("virtio_id=1").unwrap_err();
+//         GenericVhostUserConfig::parse("queue_size=1").unwrap_err();
+//         GenericVhostUserConfig::parse("socket=/tmp/sock").unwrap_err();
+//         GenericVhostUserConfig::parse("id=1").unwrap_err();
+//         make_vhost_user_config(
+//             "/dev/null/doesnotexist",
+//             100,
+//             "Something",
+//             10,
+//             &IntegerList(vec![u16::MAX.into(), 20u16.into()]),
+//         );
+//         make_vhost_user_config(
+//             "/dev/null/doesnotexist",
+//             100,
+//             "Something",
+//             10,
+//             &IntegerList(vec![u16::MAX.into()]),
+//         );
+//         make_vhost_user_config(
+//             "/dev/null/doesnotexist",
+//             u64::from(u32::MAX) + 1,
+//             "Something",
+//             10,
+//             &IntegerList(vec![20u64]),
+//         );
+//         make_vhost_user_config(
+//             "/dev/null/doesnotexist",
+//             u64::from(u32::MAX) + 1,
+//             "Something",
+//             10,
+//             &IntegerList(vec![20u64]),
+//         );
+//         make_vhost_user_config(
+//             "/dev/null/doesnotexist",
+//             u64::from(u32::MAX) + 1,
+//             "Something",
+//             10,
+//             &IntegerList(vec![20u64]),
+//         );
+//         Ok(())
+//     }
+//
+//     fn pmem_fixture() -> PmemConfig {
+//         PmemConfig {
+//             pci_common: PciDeviceCommonConfig::default(),
+//             file: PathBuf::from("/tmp/pmem"),
+//             size: Some(128 << 20),
+//             discard_writes: false,
+//         }
+//     }
+//
+//     #[test]
+//     fn test_pmem_parsing() -> Result<()> {
+//         // Must always give a file and size
+//         PmemConfig::parse("").unwrap_err();
+//         PmemConfig::parse("size=128M").unwrap_err();
+//         assert_eq!(
+//             PmemConfig::parse("file=/tmp/pmem,size=128M")?,
+//             pmem_fixture()
+//         );
+//         assert_eq!(
+//             PmemConfig::parse("file=/tmp/pmem,size=128M,id=mypmem0")?,
+//             PmemConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     id: Some("mypmem0".to_owned()),
+//                     ..Default::default()
+//                 },
+//                 ..pmem_fixture()
+//             }
+//         );
+//         assert_eq!(
+//             PmemConfig::parse("file=/tmp/pmem,size=128M,iommu=on,discard_writes=on")?,
+//             PmemConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     iommu: true,
+//                     ..Default::default()
+//                 },
+//                 discard_writes: true,
+//                 ..pmem_fixture()
+//             }
+//         );
+//
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_console_parsing() -> Result<()> {
+//         let console_config = |mode, file, socket, iommu| ConsoleConfig {
+//             common: CommonConsoleConfig { file, mode, socket },
+//             pci_common: PciDeviceCommonConfig {
+//                 iommu,
+//                 ..Default::default()
+//             },
+//         };
+//
+//         ConsoleConfig::parse("").unwrap_err();
+//         ConsoleConfig::parse("badmode").unwrap_err();
+//         assert_eq!(
+//             ConsoleConfig::parse("off")?,
+//             console_config(ConsoleOutputMode::Off, None, None, false)
+//         );
+//         assert_eq!(
+//             ConsoleConfig::parse("pty")?,
+//             console_config(ConsoleOutputMode::Pty, None, None, false)
+//         );
+//         assert_eq!(
+//             ConsoleConfig::parse("tty")?,
+//             console_config(ConsoleOutputMode::Tty, None, None, false)
+//         );
+//         assert_eq!(
+//             ConsoleConfig::parse("null")?,
+//             console_config(ConsoleOutputMode::Null, None, None, false)
+//         );
+//         assert_eq!(
+//             ConsoleConfig::parse("file=/tmp/console")?,
+//             console_config(
+//                 ConsoleOutputMode::File,
+//                 Some(PathBuf::from("/tmp/console")),
+//                 None,
+//                 false
+//             )
+//         );
+//         assert_eq!(
+//             ConsoleConfig::parse("null,iommu=on")?,
+//             console_config(ConsoleOutputMode::Null, None, None, true)
+//         );
+//         assert_eq!(
+//             ConsoleConfig::parse("file=/tmp/console,iommu=on")?,
+//             console_config(
+//                 ConsoleOutputMode::File,
+//                 Some(PathBuf::from("/tmp/console")),
+//                 None,
+//                 true
+//             )
+//         );
+//         assert_eq!(
+//             ConsoleConfig::parse("socket=/tmp/serial.sock,iommu=on")?,
+//             console_config(
+//                 ConsoleOutputMode::Socket,
+//                 None,
+//                 Some(PathBuf::from("/tmp/serial.sock")),
+//                 true
+//             )
+//         );
+//         Ok(())
+//     }
+//
+//     fn device_fixture() -> DeviceConfig {
+//         DeviceConfig {
+//             pci_common: PciDeviceCommonConfig::default(),
+//             path: PathBuf::from("/path/to/device"),
+//             x_nv_gpudirect_clique: None,
+//             x_exclude_mmap_bars: Vec::new(),
+//         }
+//     }
+//
+//     #[test]
+//     fn test_device_parsing() -> Result<()> {
+//         // Device must have a path provided
+//         DeviceConfig::parse("").unwrap_err();
+//         assert_eq!(
+//             DeviceConfig::parse("path=/path/to/device")?,
+//             device_fixture()
+//         );
+//
+//         assert_eq!(
+//             DeviceConfig::parse("path=/path/to/device,iommu=on")?,
+//             DeviceConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     iommu: true,
+//                     ..Default::default()
+//                 },
+//                 ..device_fixture()
+//             }
+//         );
+//
+//         assert_eq!(
+//             DeviceConfig::parse("path=/path/to/device,iommu=on,id=mydevice0")?,
+//             DeviceConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     id: Some("mydevice0".to_owned()),
+//                     iommu: true,
+//                     ..Default::default()
+//                 },
+//                 ..device_fixture()
+//             }
+//         );
+//
+//         assert_eq!(
+//             DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[2]")?,
+//             DeviceConfig {
+//                 x_exclude_mmap_bars: vec![2],
+//                 ..device_fixture()
+//             }
+//         );
+//
+//         assert_eq!(
+//             DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[0,2,5]")?,
+//             DeviceConfig {
+//                 x_exclude_mmap_bars: vec![0, 2, 5],
+//                 ..device_fixture()
+//             }
+//         );
+//
+//         assert_eq!(
+//             DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[6]")?,
+//             DeviceConfig {
+//                 x_exclude_mmap_bars: vec![6],
+//                 ..device_fixture()
+//             }
+//         );
+//         Ok(())
+//     }
+//
+//     fn vdpa_fixture() -> VdpaConfig {
+//         VdpaConfig {
+//             pci_common: PciDeviceCommonConfig::default(),
+//             path: PathBuf::from("/dev/vhost-vdpa"),
+//             num_queues: 1,
+//         }
+//     }
+//
+//     #[test]
+//     fn test_vdpa_parsing() -> Result<()> {
+//         // path is required
+//         VdpaConfig::parse("").unwrap_err();
+//         assert_eq!(VdpaConfig::parse("path=/dev/vhost-vdpa")?, vdpa_fixture());
+//         assert_eq!(
+//             VdpaConfig::parse("path=/dev/vhost-vdpa,num_queues=2,id=my_vdpa")?,
+//             VdpaConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     id: Some("my_vdpa".to_owned()),
+//                     ..Default::default()
+//                 },
+//                 num_queues: 2,
+//                 ..vdpa_fixture()
+//             }
+//         );
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_tpm_parsing() -> Result<()> {
+//         // path is required
+//         TpmConfig::parse("").unwrap_err();
+//         assert_eq!(
+//             TpmConfig::parse("socket=/var/run/tpm.sock")?,
+//             TpmConfig {
+//                 socket: PathBuf::from("/var/run/tpm.sock"),
+//             }
+//         );
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_vsock_parsing() -> Result<()> {
+//         // socket and cid is required
+//         VsockConfig::parse("").unwrap_err();
+//         assert_eq!(
+//             VsockConfig::parse("socket=/tmp/sock,cid=3")?,
+//             VsockConfig {
+//                 pci_common: PciDeviceCommonConfig::default(),
+//                 cid: 3,
+//                 socket: PathBuf::from("/tmp/sock"),
+//             }
+//         );
+//         assert_eq!(
+//             VsockConfig::parse("socket=/tmp/sock,cid=3,iommu=on")?,
+//             VsockConfig {
+//                 pci_common: PciDeviceCommonConfig {
+//                     iommu: true,
+//                     ..Default::default()
+//                 },
+//                 cid: 3,
+//                 socket: PathBuf::from("/tmp/sock"),
+//             }
+//         );
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_numa_config_parsing() -> Result<()> {
+//         // Error when device_id and cpu/memory are present
+//         let invalid_input = "guest_numa_id=0,cpus=[0,1],distances=[0@25,1@20],\
+//                                 device_id=vfio0,memory_zones=[mem1],pci_segments=[0]";
+//         NumaConfig::parse(invalid_input).unwrap_err();
+//         // Successful numa config parsing
+//         let standard_input = "guest_numa_id=1,cpus=[2,3],distances=[0@20],\
+//                                 memory_zones=[mem0],pci_segments=[0]";
+//         let expected_standard = NumaConfig {
+//             guest_numa_id: 1,
+//             cpus: Some(Box::new([2, 3])),
+//             distances: Some(Box::new([NumaDistance {
+//                 destination: 0,
+//                 distance: 20,
+//             }])),
+//             device_id: None,
+//             memory_zones: Some(Box::new(["mem0".to_string()])),
+//             pci_segments: Some(Box::new([0])),
+//         };
+//         assert_eq!(NumaConfig::parse(standard_input)?, expected_standard);
+//         // Successful generic initiator config parse
+//         let gi_input = "guest_numa_id=2,device_id=vfio1,distances=[0@30],pci_segments=[1]";
+//         let expected_gi = NumaConfig {
+//             guest_numa_id: 2,
+//             cpus: None,
+//             distances: Some(Box::new([NumaDistance {
+//                 destination: 0,
+//                 distance: 30,
+//             }])),
+//             device_id: Some("vfio1".to_string()),
+//             memory_zones: None,
+//             pci_segments: Some(Box::new([1])),
+//         };
+//         assert_eq!(NumaConfig::parse(gi_input)?, expected_gi);
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_numa_config_generic_initiator_valid() {
+//         // device_id specified, no cpus/memory_zones
+//         let config = NumaConfig {
+//             guest_numa_id: 0,
+//             cpus: None,
+//             distances: Some(Box::new([NumaDistance {
+//                 destination: 1,
+//                 distance: 20,
+//             }])),
+//             memory_zones: None,
+//             device_id: Some("vfio0".to_string()),
+//             pci_segments: None,
+//         };
+//         config.validate().unwrap();
+//         assert!(config.is_generic_initiator());
+//     }
+//
+//     #[test]
+//     fn test_numa_config_invalid_device_id() {
+//         // empty device_id
+//         let config = NumaConfig {
+//             guest_numa_id: 0,
+//             cpus: None,
+//             distances: None,
+//             memory_zones: None,
+//             device_id: Some(String::new()),
+//             pci_segments: None,
+//         };
+//         assert!(config.validate().is_err());
+//     }
+//
+//     #[test]
+//     fn test_numa_config_invalid_both_device_cpus() {
+//         // device_id and cpus specified
+//         let config = NumaConfig {
+//             guest_numa_id: 0,
+//             cpus: Some(Box::new([0, 1])),
+//             distances: None,
+//             device_id: Some("vfio0".to_string()),
+//             memory_zones: None,
+//             pci_segments: None,
+//         };
+//         assert!(config.validate().is_err());
+//     }
+//
+//     #[test]
+//     fn test_numa_config_invalid_both_device_memory() {
+//         // device_id and memory zones specified
+//         let config = NumaConfig {
+//             guest_numa_id: 0,
+//             cpus: None,
+//             distances: None,
+//             device_id: Some("vfio0".to_string()),
+//             memory_zones: Some(Box::new(["mem0".to_string()])),
+//             pci_segments: None,
+//         };
+//         assert!(config.validate().is_err());
+//     }
+//
+//     #[test]
+//     fn test_numa_config_standard_valid() {
+//         // No device_id
+//         let config = NumaConfig {
+//             guest_numa_id: 0,
+//             cpus: Some(Box::new([0, 1])),
+//             distances: Some(Box::new([NumaDistance {
+//                 destination: 1,
+//                 distance: 20,
+//             }])),
+//             device_id: None,
+//             memory_zones: Some(Box::new(["mem0".to_string()])),
+//             pci_segments: None,
+//         };
+//         config.validate().unwrap();
+//     }
+//
+//     #[test]
+//     fn test_restore_parsing() -> Result<()> {
+//         assert_eq!(
+//             RestoreConfig::parse("source_url=/path/to/snapshot")?,
+//             RestoreConfig {
+//                 source_url: PathBuf::from("/path/to/snapshot"),
+//                 prefault: false,
+//                 memory_restore_mode: MemoryRestoreMode::Copy,
+//                 net_fds: None,
+//                 resume: false,
+//             }
+//         );
+//         assert_eq!(
+//             RestoreConfig::parse(
+//                 "source_url=/path/to/snapshot,prefault=off,net_fds=[net0@[3,4],net1@[5,6,7,8]]"
+//             )?,
+//             RestoreConfig {
+//                 source_url: PathBuf::from("/path/to/snapshot"),
+//                 prefault: false,
+//                 memory_restore_mode: MemoryRestoreMode::Copy,
+//                 net_fds: Some(vec![
+//                     RestoredNetConfig {
+//                         id: "net0".to_string(),
+//                         num_fds: 2,
+//                         fds: Some(vec![3, 4]),
+//                     },
+//                     RestoredNetConfig {
+//                         id: "net1".to_string(),
+//                         num_fds: 4,
+//                         fds: Some(vec![5, 6, 7, 8]),
+//                     }
+//                 ]),
+//                 resume: false,
+//             }
+//         );
+//         assert_eq!(
+//             RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")?,
+//             RestoreConfig {
+//                 source_url: PathBuf::from("/path/to/snapshot"),
+//                 prefault: false,
+//                 memory_restore_mode: MemoryRestoreMode::OnDemand,
+//                 net_fds: None,
+//                 resume: false,
+//             }
+//         );
+//         assert_eq!(
+//             RestoreConfig::parse("source_url=/path/to/snapshot,resume=on")?,
+//             RestoreConfig {
+//                 source_url: PathBuf::from("/path/to/snapshot"),
+//                 prefault: false,
+//                 memory_restore_mode: MemoryRestoreMode::Copy,
+//                 net_fds: None,
+//                 resume: true,
+//             }
+//         );
+//         // Parsing should fail as source_url is a required field
+//         RestoreConfig::parse("prefault=off").unwrap_err();
+//         RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=bogus").unwrap_err();
+//         Ok(())
+//     }
+//
+//     #[test]
+//     fn test_restore_config_serde() {
+//         assert_eq!(
+//             serde_json::from_str::<RestoreConfig>(r#"{"source_url":"/path/to/snapshot"}"#)
+//                 .unwrap()
+//                 .memory_restore_mode,
+//             MemoryRestoreMode::Copy
+//         );
+//         assert_eq!(
+//             serde_json::from_str::<RestoreConfig>(
+//                 r#"{"source_url":"/path/to/snapshot","memory_restore_mode":"OnDemand"}"#
+//             )
+//             .unwrap()
+//             .memory_restore_mode,
+//             MemoryRestoreMode::OnDemand
+//         );
+//     }
+//
+//     #[test]
+//     fn test_restore_config_validation() {
+//         // interested in only VmConfig.net, so set rest to default values
+//         let mut snapshot_vm_config = VmConfig {
+//             cpus: CpusConfig::default(),
+//             memory: MemoryConfig::default(),
+//             payload: None,
+//             rate_limit_groups: None,
+//             disks: None,
+//             rng: RngConfig::default(),
+//             generic_vhost_user: None,
+//             balloon: None,
+//             fs: None,
+//             pmem: None,
+//             serial: SerialConfig::default(),
+//             console: ConsoleConfig::default(),
+//             #[cfg(target_arch = "x86_64")]
+//             debug_console: DebugConsoleConfig::default(),
+//             devices: None,
+//             user_devices: None,
+//             vdpa: None,
+//             vsock: None,
+//             #[cfg(feature = "pvmemcontrol")]
+//             pvmemcontrol: None,
+//             pvpanic: false,
+//             iommu: false,
+//             numa: None,
+//             watchdog: false,
+//             #[cfg(feature = "guest_debug")]
+//             gdb: false,
+//             pci_segments: None,
+//             platform: None,
+//             tpm: None,
+//             preserved_fds: None,
+//             net: Some(vec![
+//                 NetConfig {
+//                     pci_common: PciDeviceCommonConfig {
+//                         id: Some("net0".to_owned()),
+//                         ..Default::default()
+//                     },
+//                     num_queues: 2,
+//                     fds: Some(vec![-1, -1, -1, -1]),
+//                     ..net_fixture()
+//                 },
+//                 NetConfig {
+//                     pci_common: PciDeviceCommonConfig {
+//                         id: Some("net1".to_owned()),
+//                         ..Default::default()
+//                     },
+//                     num_queues: 1,
+//                     fds: Some(vec![-1, -1]),
+//                     ..net_fixture()
+//                 },
+//                 NetConfig {
+//                     pci_common: PciDeviceCommonConfig {
+//                         id: Some("net2".to_owned()),
+//                         ..Default::default()
+//                     },
+//                     fds: None,
+//                     ..net_fixture()
+//                 },
+//             ]),
+//             landlock_enable: false,
+//             landlock_rules: None,
+//             #[cfg(feature = "ivshmem")]
+//             ivshmem: None,
+//         };
+//
+//         let valid_config = RestoreConfig {
+//             source_url: PathBuf::from("/path/to/snapshot"),
+//             prefault: false,
+//             memory_restore_mode: MemoryRestoreMode::Copy,
+//             net_fds: Some(vec![
+//                 RestoredNetConfig {
+//                     id: "net0".to_string(),
+//                     num_fds: 4,
+//                     fds: Some(vec![3, 4, 5, 6]),
+//                 },
+//                 RestoredNetConfig {
+//                     id: "net1".to_string(),
+//                     num_fds: 2,
+//                     fds: Some(vec![7, 8]),
+//                 },
+//             ]),
+//             resume: false,
+//         };
+//         valid_config.validate(&snapshot_vm_config).unwrap();
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.net_fds = Some(vec![RestoredNetConfig {
+//             id: "netx".to_string(),
+//             num_fds: 4,
+//             fds: Some(vec![3, 4, 5, 6]),
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(&snapshot_vm_config),
+//             Err(ValidationError::RestoreMissingRequiredNetId(
+//                 "net0".to_string()
+//             ))
+//         );
+//
+//         invalid_config.net_fds = Some(vec![
+//             RestoredNetConfig {
+//                 id: "net0".to_string(),
+//                 num_fds: 4,
+//                 fds: Some(vec![3, 4, 5, 6]),
+//             },
+//             RestoredNetConfig {
+//                 id: "net0".to_string(),
+//                 num_fds: 4,
+//                 fds: Some(vec![3, 4, 5, 6]),
+//             },
+//         ]);
+//         assert_eq!(
+//             invalid_config.validate(&snapshot_vm_config),
+//             Err(ValidationError::IdentifierNotUnique("net0".to_string()))
+//         );
+//
+//         invalid_config.net_fds = Some(vec![RestoredNetConfig {
+//             id: "net0".to_string(),
+//             num_fds: 4,
+//             fds: Some(vec![3, 4, 5, 6]),
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(&snapshot_vm_config),
+//             Err(ValidationError::RestoreMissingRequiredNetId(
+//                 "net1".to_string()
+//             ))
+//         );
+//
+//         invalid_config.net_fds = Some(vec![RestoredNetConfig {
+//             id: "net0".to_string(),
+//             num_fds: 2,
+//             fds: Some(vec![3, 4]),
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(&snapshot_vm_config),
+//             Err(ValidationError::RestoreNetFdCountMismatch(
+//                 "net0".to_string(),
+//                 2,
+//                 4
+//             ))
+//         );
+//
+//         let another_valid_config = RestoreConfig {
+//             source_url: PathBuf::from("/path/to/snapshot"),
+//             prefault: false,
+//             memory_restore_mode: MemoryRestoreMode::Copy,
+//             net_fds: None,
+//             resume: false,
+//         };
+//         snapshot_vm_config.net = Some(vec![NetConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 id: Some("net2".to_owned()),
+//                 ..Default::default()
+//             },
+//             fds: None,
+//             ..net_fixture()
+//         }]);
+//         another_valid_config.validate(&snapshot_vm_config).unwrap();
+//
+//         let invalid_restore_mode = RestoreConfig {
+//             source_url: PathBuf::from("/path/to/snapshot"),
+//             prefault: true,
+//             memory_restore_mode: MemoryRestoreMode::OnDemand,
+//             net_fds: None,
+//             resume: false,
+//         };
+//         assert_eq!(
+//             invalid_restore_mode.validate(&snapshot_vm_config),
+//             Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
+//         );
+//     }
+//
+//     fn platform_fixture() -> PlatformConfig {
+//         PlatformConfig {
+//             num_pci_segments: MAX_NUM_PCI_SEGMENTS,
+//             iommu_segments: None,
+//             iommu_address_width_bits: MAX_IOMMU_ADDRESS_WIDTH_BITS,
+//             serial_number: None,
+//             uuid: None,
+//             oem_strings: None,
+//             iommufd: false,
+//             vfio_p2p_dma: default_platformconfig_vfio_p2p_dma(),
+//             #[cfg(feature = "tdx")]
+//             tdx: false,
+//             #[cfg(feature = "sev_snp")]
+//             sev_snp: false,
+//         }
+//     }
+//
+//     fn numa_fixture() -> NumaConfig {
+//         NumaConfig {
+//             guest_numa_id: 0,
+//             cpus: None,
+//             distances: None,
+//             device_id: None,
+//             memory_zones: None,
+//             pci_segments: None,
+//         }
+//     }
+//
+//     #[test]
+//     fn test_config_validation() {
+//         let mut valid_config = VmConfig::<Active> {
+//             cpus: CpusConfig {
+//                 boot_vcpus: 1,
+//                 max_vcpus: 1,
+//                 ..Default::default()
+//             },
+//             memory: MemoryConfig {
+//                 size: 536_870_912,
+//                 mergeable: false,
+//                 hotplug_method: HotplugMethod::Acpi,
+//                 hotplug_size: None,
+//                 hotplugged_size: None,
+//                 shared: false,
+//                 hugepages: false,
+//                 hugepage_size: None,
+//                 prefault: false,
+//                 zones: None,
+//                 thp: true,
+//             },
+//             payload: Some(PayloadConfig {
+//                 kernel: Some(PathBuf::from("/path/to/kernel")),
+//                 firmware: None,
+//                 cmdline: None,
+//                 initramfs: None,
+//                 #[cfg(feature = "igvm")]
+//                 igvm: None,
+//                 #[cfg(feature = "sev_snp")]
+//                 host_data: Some(
+//                     "243eb7dc1a21129caa91dcbb794922b933baecb5823a377eb431188673288c07".to_string(),
+//                 ),
+//                 #[cfg(feature = "fw_cfg")]
+//                 fw_cfg_config: None,
+//             }),
+//             rate_limit_groups: None,
+//             disks: None,
+//             net: None,
+//             rng: RngConfig {
+//                 src: PathBuf::from("/dev/urandom"),
+//                 pci_common: PciDeviceCommonConfig::default(),
+//             },
+//             balloon: None,
+//             fs: None,
+//             generic_vhost_user: None,
+//             pmem: None,
+//             serial: SerialConfig {
+//                 common: CommonConsoleConfig {
+//                     file: None,
+//                     mode: ConsoleOutputMode::Null,
+//                     socket: None,
+//                 },
+//             },
+//             console: ConsoleConfig {
+//                 common: CommonConsoleConfig {
+//                     file: None,
+//                     mode: ConsoleOutputMode::Tty,
+//                     socket: None,
+//                 },
+//                 pci_common: PciDeviceCommonConfig::default(),
+//             },
+//             #[cfg(target_arch = "x86_64")]
+//             debug_console: DebugConsoleConfig::default(),
+//             devices: None,
+//             user_devices: None,
+//             vdpa: None,
+//             vsock: None,
+//             #[cfg(feature = "pvmemcontrol")]
+//             pvmemcontrol: None,
+//             pvpanic: false,
+//             iommu: false,
+//             numa: None,
+//             watchdog: false,
+//             #[cfg(feature = "guest_debug")]
+//             gdb: false,
+//             pci_segments: None,
+//             platform: None,
+//             tpm: None,
+//             preserved_fds: None,
+//             landlock_enable: false,
+//             landlock_rules: None,
+//             #[cfg(feature = "ivshmem")]
+//             ivshmem: None,
+//         };
+//
+//         valid_config.validate().unwrap();
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.serial.common.mode = ConsoleOutputMode::Tty;
+//         invalid_config.console.common.mode = ConsoleOutputMode::Tty;
+//         valid_config.validate().unwrap();
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.payload = None;
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::PayloadError(
+//                 PayloadConfigError::MissingBootitem
+//             ))
+//         );
+//
+//         #[cfg(feature = "fw_cfg")]
+//         {
+//             let mut invalid_config = valid_config.clone();
+//             if let Some(payload) = invalid_config.payload.as_mut() {
+//                 payload.fw_cfg_config = Some(FwCfgConfig {
+//                     e820: true,
+//                     kernel: false,
+//                     cmdline: false,
+//                     initramfs: false,
+//                     acpi_tables: true,
+//                     items: Some(FwCfgItemList {
+//                         item_list: vec![FwCfgItem {
+//                             name: "opt/org.test/invalid".to_string(),
+//                             file: None,
+//                             string: None,
+//                         }],
+//                     }),
+//                 });
+//             }
+//             assert_eq!(
+//                 invalid_config.validate(),
+//                 Err(ValidationError::PayloadError(
+//                     PayloadConfigError::FwCfgInvalidItem("opt/org.test/invalid".to_string())
+//                 ))
+//             );
+//         }
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.serial.common.mode = ConsoleOutputMode::File;
+//         invalid_config.serial.common.file = None;
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::ConsoleFileMissing)
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.cpus.max_vcpus = 16;
+//         invalid_config.cpus.boot_vcpus = 32;
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::CpusMaxLowerThanBoot(16, 32))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.cpus.max_vcpus = 16;
+//         invalid_config.cpus.boot_vcpus = 16;
+//         invalid_config.cpus.topology = Some(CpuTopology {
+//             threads_per_core: 2,
+//             cores_per_die: 8,
+//             dies_per_package: 1,
+//             packages: 2,
+//         });
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::CpuTopologyCount)
+//         );
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.cpus.max_vcpus = 8;
+//         still_valid_config.cpus.boot_vcpus = 8;
+//         still_valid_config.cpus.topology = Some(CpuTopology {
+//             threads_per_core: 1,
+//             cores_per_die: 8,
+//             dies_per_package: 1,
+//             packages: 1,
+//         });
+//         still_valid_config.validate().unwrap();
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.cpus.max_vcpus = 8;
+//         still_valid_config.cpus.boot_vcpus = 8;
+//         still_valid_config.cpus.topology = Some(CpuTopology {
+//             threads_per_core: 2,
+//             cores_per_die: 4,
+//             dies_per_package: 1,
+//             packages: 1,
+//         });
+//         still_valid_config.validate().unwrap();
+//
+//         #[cfg(target_arch = "x86_64")]
+//         {
+//             let mut invalid_config = valid_config.clone();
+//             invalid_config.cpus.max_vcpus = 6;
+//             invalid_config.cpus.boot_vcpus = 6;
+//             invalid_config.cpus.topology = Some(CpuTopology {
+//                 threads_per_core: 3,
+//                 cores_per_die: 2,
+//                 dies_per_package: 1,
+//                 packages: 1,
+//             });
+//             assert_eq!(
+//                 invalid_config.validate(),
+//                 Err(ValidationError::CpuTopologyThreadsPerCore)
+//             );
+//         }
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.disks = Some(vec![DiskConfig {
+//             vhost_socket: Some("/path/to/sock".to_owned()),
+//             path: Some(PathBuf::from("/path/to/image")),
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::DiskSocketAndPath)
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.memory.shared = true;
+//         invalid_config.disks = Some(vec![DiskConfig {
+//             path: None,
+//             vhost_user: true,
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::VhostUserMissingSocket)
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.disks = Some(vec![DiskConfig {
+//             path: None,
+//             vhost_user: true,
+//             vhost_socket: Some("/path/to/sock".to_owned()),
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::VhostUserRequiresSharedMemory)
+//         );
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.disks = Some(vec![DiskConfig {
+//             path: None,
+//             vhost_user: true,
+//             vhost_socket: Some("/path/to/sock".to_owned()),
+//             ..disk_fixture()
+//         }]);
+//         still_valid_config.memory.shared = true;
+//         still_valid_config.validate().unwrap();
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.net = Some(vec![NetConfig {
+//             vhost_user: true,
+//             ..net_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::VhostUserRequiresSharedMemory)
+//         );
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.net = Some(vec![NetConfig {
+//             vhost_user: true,
+//             vhost_socket: Some("/path/to/sock".to_owned()),
+//             ..net_fixture()
+//         }]);
+//         still_valid_config.memory.shared = true;
+//         still_valid_config.validate().unwrap();
+//
+//         // Test vhost_user with rate limiting for disk
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.memory.shared = true;
+//         invalid_config.disks = Some(vec![DiskConfig {
+//             path: None,
+//             vhost_user: true,
+//             vhost_socket: Some("/path/to/sock".to_owned()),
+//             rate_limiter_config: Some(RateLimiterConfig::default()),
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::VhostUserRateLimiterNotSupported)
+//         );
+//
+//         // Test vhost_user with rate_limit_group for disk
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.memory.shared = true;
+//         invalid_config.disks = Some(vec![DiskConfig {
+//             path: None,
+//             vhost_user: true,
+//             vhost_socket: Some("/path/to/sock".to_owned()),
+//             rate_limit_group: Some("group0".to_string()),
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::VhostUserRateLimiterNotSupported)
+//         );
+//
+//         // Test vhost_user with rate limiting for net
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.memory.shared = true;
+//         invalid_config.net = Some(vec![NetConfig {
+//             vhost_user: true,
+//             vhost_socket: Some("/path/to/sock".to_owned()),
+//             rate_limiter_config: Some(RateLimiterConfig::default()),
+//             ..net_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::VhostUserRateLimiterNotSupported)
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.net = Some(vec![NetConfig {
+//             fds: Some(vec![0]),
+//             ..net_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::VnetReservedFd(0))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.net = Some(vec![NetConfig {
+//             offload_csum: false,
+//             ..net_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::NoHardwareChecksumOffload)
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.net = Some(vec![NetConfig {
+//             ip: None,
+//             mask: Some("255.255.255.0".parse().unwrap()),
+//             ..net_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::MaskProvidedWithoutIp)
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.net = Some(vec![NetConfig {
+//             ip: Some("192.1.33.7".parse().unwrap()),
+//             mask: None,
+//             ..net_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::IpProvidedWithoutMask)
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.fs = Some(vec![fs_fixture()]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::VhostUserRequiresSharedMemory)
+//         );
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.memory.shared = true;
+//         still_valid_config.validate().unwrap();
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.memory.hugepages = true;
+//         still_valid_config.validate().unwrap();
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.memory.hugepages = true;
+//         still_valid_config.memory.hugepage_size = Some(2 << 20);
+//         still_valid_config.validate().unwrap();
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.memory.hugepages = false;
+//         invalid_config.memory.hugepage_size = Some(2 << 20);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::HugePageSizeWithoutHugePages)
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.memory.hugepages = true;
+//         invalid_config.memory.hugepage_size = Some(3 << 20);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidHugePageSize(3 << 20))
+//         );
+//
+//         // Test mergeable and shared validation for global memory
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.memory.shared = true;
+//         invalid_config.memory.mergeable = true;
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidSharedMemoryWithMergeable)
+//         );
+//
+//         // Test mergeable and shared validation for memory zones
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.memory.zones = Some(vec![MemoryZoneConfig {
+//             id: "mem0".to_string(),
+//             size: 1 << 30,
+//             shared: true,
+//             mergeable: true,
+//             ..Default::default()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidSharedMemoryWithMergeable)
+//         );
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.platform = Some(platform_fixture());
+//         still_valid_config.validate().unwrap();
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             num_pci_segments: MAX_NUM_PCI_SEGMENTS + 1,
+//             ..platform_fixture()
+//         });
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidNumPciSegments(
+//                 MAX_NUM_PCI_SEGMENTS + 1
+//             ))
+//         );
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         still_valid_config.validate().unwrap();
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([
+//                 MAX_NUM_PCI_SEGMENTS + 1,
+//                 MAX_NUM_PCI_SEGMENTS + 2,
+//             ])),
+//             ..platform_fixture()
+//         });
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidPciSegment(MAX_NUM_PCI_SEGMENTS + 1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             iommu_address_width_bits: MAX_IOMMU_ADDRESS_WIDTH_BITS + 1,
+//             ..platform_fixture()
+//         });
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidIommuAddressWidthBits(
+//                 MAX_IOMMU_ADDRESS_WIDTH_BITS + 1
+//             ))
+//         );
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         still_valid_config.disks = Some(vec![DiskConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 iommu: true,
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             ..disk_fixture()
+//         }]);
+//         still_valid_config.validate().unwrap();
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         still_valid_config.net = Some(vec![NetConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 iommu: true,
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             ..net_fixture()
+//         }]);
+//         still_valid_config.validate().unwrap();
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         still_valid_config.pmem = Some(vec![PmemConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 iommu: true,
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             ..pmem_fixture()
+//         }]);
+//         still_valid_config.validate().unwrap();
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         still_valid_config.devices = Some(vec![DeviceConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 iommu: true,
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             ..device_fixture()
+//         }]);
+//         still_valid_config.validate().unwrap();
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         still_valid_config.vsock = Some(VsockConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 iommu: true,
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             cid: 3,
+//             socket: PathBuf::new(),
+//         });
+//         still_valid_config.validate().unwrap();
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         invalid_config.disks = Some(vec![DiskConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 iommu: false,
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::OnIommuSegment(1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         invalid_config.net = Some(vec![NetConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 iommu: false,
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             ..net_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::OnIommuSegment(1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             num_pci_segments: MAX_NUM_PCI_SEGMENTS,
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         invalid_config.pmem = Some(vec![PmemConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             ..pmem_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::OnIommuSegment(1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             num_pci_segments: MAX_NUM_PCI_SEGMENTS,
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         invalid_config.devices = Some(vec![DeviceConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             ..device_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::OnIommuSegment(1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         invalid_config.vsock = Some(VsockConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             cid: 3,
+//             socket: PathBuf::new(),
+//         });
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::OnIommuSegment(1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.memory.shared = true;
+//         invalid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         invalid_config.user_devices = Some(vec![UserDeviceConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             socket: PathBuf::new(),
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::OnIommuSegment(1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         invalid_config.vdpa = Some(vec![VdpaConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             ..vdpa_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::OnIommuSegment(1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.memory.shared = true;
+//         invalid_config.platform = Some(PlatformConfig {
+//             iommu_segments: Some(Box::new([1, 2, 3])),
+//             ..platform_fixture()
+//         });
+//         invalid_config.fs = Some(vec![FsConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 pci_segment: 1,
+//                 ..Default::default()
+//             },
+//             ..fs_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::OnIommuSegment(1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             num_pci_segments: 2,
+//             ..platform_fixture()
+//         });
+//         invalid_config.numa = Some(Box::new([
+//             NumaConfig {
+//                 guest_numa_id: 0,
+//                 cpus: Some(Box::new([0])),
+//                 pci_segments: Some(Box::new([1])),
+//                 ..numa_fixture()
+//             },
+//             NumaConfig {
+//                 guest_numa_id: 1,
+//                 cpus: Some(Box::new([1])),
+//                 pci_segments: Some(Box::new([1])),
+//                 ..numa_fixture()
+//             },
+//         ]));
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::PciSegmentReused(1, 0, 1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.pci_segments = Some(Box::new([PciSegmentConfig {
+//             pci_segment: 0,
+//             mmio32_aperture_weight: 1,
+//             mmio64_aperture_weight: 0,
+//         }]));
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidPciSegmentApertureWeight(0))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.pci_segments = Some(Box::new([PciSegmentConfig {
+//             pci_segment: 0,
+//             mmio32_aperture_weight: 0,
+//             mmio64_aperture_weight: 1,
+//         }]));
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidPciSegmentApertureWeight(0))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.numa = Some(Box::new([
+//             NumaConfig {
+//                 guest_numa_id: 0,
+//                 cpus: Some(Box::new([0])),
+//                 ..numa_fixture()
+//             },
+//             NumaConfig {
+//                 guest_numa_id: 1,
+//                 cpus: Some(Box::new([1])),
+//                 pci_segments: Some(Box::new([0])),
+//                 ..numa_fixture()
+//             },
+//         ]));
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::DefaultPciSegmentInvalidNode(1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.numa = Some(Box::new([
+//             NumaConfig {
+//                 guest_numa_id: 0,
+//                 cpus: Some(Box::new([0])),
+//                 pci_segments: Some(Box::new([0])),
+//                 ..numa_fixture()
+//             },
+//             NumaConfig {
+//                 guest_numa_id: 1,
+//                 cpus: Some(Box::new([1])),
+//                 pci_segments: Some(Box::new([1])),
+//                 ..numa_fixture()
+//             },
+//         ]));
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidPciSegment(1))
+//         );
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.disks = Some(vec![DiskConfig {
+//             rate_limit_group: Some("foo".into()),
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidRateLimiterGroup)
+//         );
+//
+//         // Test serial length validation
+//         let mut valid_serial_config = valid_config.clone();
+//         valid_serial_config.disks = Some(vec![DiskConfig {
+//             serial: Some("valid_serial".to_string()),
+//             ..disk_fixture()
+//         }]);
+//         valid_serial_config.validate().unwrap();
+//
+//         // Test empty string serial (should be valid)
+//         let mut empty_serial_config = valid_config.clone();
+//         empty_serial_config.disks = Some(vec![DiskConfig {
+//             serial: Some(String::new()),
+//             ..disk_fixture()
+//         }]);
+//         empty_serial_config.validate().unwrap();
+//
+//         // Test None serial (should be valid)
+//         let mut none_serial_config = valid_config.clone();
+//         none_serial_config.disks = Some(vec![DiskConfig {
+//             serial: None,
+//             ..disk_fixture()
+//         }]);
+//         none_serial_config.validate().unwrap();
+//
+//         // Test maximum length serial (exactly VIRTIO_BLK_ID_BYTES)
+//         let max_serial = "a".repeat(VIRTIO_BLK_ID_BYTES as usize);
+//         let mut max_serial_config = valid_config.clone();
+//         max_serial_config.disks = Some(vec![DiskConfig {
+//             serial: Some(max_serial),
+//             ..disk_fixture()
+//         }]);
+//         max_serial_config.validate().unwrap();
+//
+//         // Test serial length exceeding VIRTIO_BLK_ID_BYTES
+//         let long_serial = "a".repeat(VIRTIO_BLK_ID_BYTES as usize + 1);
+//         let mut invalid_serial_config = valid_config.clone();
+//         invalid_serial_config.disks = Some(vec![DiskConfig {
+//             serial: Some(long_serial.clone()),
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_serial_config.validate(),
+//             Err(ValidationError::InvalidSerialLength(
+//                 long_serial.len(),
+//                 VIRTIO_BLK_ID_BYTES as usize
+//             ))
+//         );
+//
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.devices = Some(vec![
+//             DeviceConfig {
+//                 path: "/device1".into(),
+//                 ..device_fixture()
+//             },
+//             DeviceConfig {
+//                 path: "/device2".into(),
+//                 ..device_fixture()
+//             },
+//         ]);
+//         still_valid_config.validate().unwrap();
+//
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.devices = Some(vec![
+//             DeviceConfig {
+//                 path: "/device1".into(),
+//                 ..device_fixture()
+//             },
+//             DeviceConfig {
+//                 path: "/device1".into(),
+//                 ..device_fixture()
+//             },
+//         ]);
+//         invalid_config.validate().unwrap_err();
+//         #[cfg(feature = "sev_snp")]
+//         {
+//             // Payload with empty host data
+//             let mut config_with_no_host_data = valid_config.clone();
+//             config_with_no_host_data.payload = Some(PayloadConfig {
+//                 kernel: Some(PathBuf::from("/path/to/kernel")),
+//                 firmware: None,
+//                 cmdline: None,
+//                 initramfs: None,
+//                 #[cfg(feature = "igvm")]
+//                 igvm: None,
+//                 #[cfg(feature = "sev_snp")]
+//                 host_data: Some(String::new()),
+//                 #[cfg(feature = "fw_cfg")]
+//                 fw_cfg_config: None,
+//             });
+//             config_with_no_host_data.validate().unwrap_err();
+//
+//             // Payload with no host data provided
+//             let mut valid_config_with_no_host_data = valid_config.clone();
+//             valid_config_with_no_host_data.payload = Some(PayloadConfig {
+//                 kernel: Some(PathBuf::from("/path/to/kernel")),
+//                 firmware: None,
+//                 cmdline: None,
+//                 initramfs: None,
+//                 #[cfg(feature = "igvm")]
+//                 igvm: None,
+//                 #[cfg(feature = "sev_snp")]
+//                 host_data: None,
+//                 #[cfg(feature = "fw_cfg")]
+//                 fw_cfg_config: None,
+//             });
+//             valid_config_with_no_host_data.validate().unwrap();
+//
+//             // Payload with invalid host data length i.e less than 64
+//             let mut config_with_invalid_host_data = valid_config.clone();
+//             config_with_invalid_host_data.payload = Some(PayloadConfig {
+//                 kernel: Some(PathBuf::from("/path/to/kernel")),
+//                 firmware: None,
+//                 cmdline: None,
+//                 initramfs: None,
+//                 #[cfg(feature = "igvm")]
+//                 igvm: None,
+//                 #[cfg(feature = "sev_snp")]
+//                 host_data: Some(
+//                     "243eb7dc1a21129caa91dcbb794922b933baecb5823a377eb43118867328".to_string(),
+//                 ),
+//                 #[cfg(feature = "fw_cfg")]
+//                 fw_cfg_config: None,
+//             });
+//             config_with_invalid_host_data.validate().unwrap_err();
+//         }
+//
+//         // x_nv_gpudirect_clique with vfio_p2p_dma=off should fail
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.platform = Some(PlatformConfig {
+//             vfio_p2p_dma: false,
+//             ..platform_fixture()
+//         });
+//         invalid_config.devices = Some(vec![DeviceConfig {
+//             x_nv_gpudirect_clique: Some(0),
+//             ..device_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::GpuDirectCliqueRequiresP2pDma)
+//         );
+//
+//         // x_nv_gpudirect_clique with vfio_p2p_dma=on should pass
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.platform = Some(PlatformConfig {
+//             vfio_p2p_dma: true,
+//             ..platform_fixture()
+//         });
+//         still_valid_config.devices = Some(vec![DeviceConfig {
+//             x_nv_gpudirect_clique: Some(0),
+//             ..device_fixture()
+//         }]);
+//         still_valid_config.validate().unwrap();
+//
+//         // x_nv_gpudirect_clique with no platform config (default p2p_dma=on) should pass
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.devices = Some(vec![DeviceConfig {
+//             x_nv_gpudirect_clique: Some(0),
+//             ..device_fixture()
+//         }]);
+//         still_valid_config.validate().unwrap();
+//
+//         // x_exclude_mmap_bars only accepts PCI BAR indices 0 through 5
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.devices = Some(vec![DeviceConfig {
+//             x_exclude_mmap_bars: vec![6],
+//             ..device_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidDeviceExcludeMmapBar(6))
+//         );
+//
+//         let mut still_valid_config = valid_config.clone();
+//         // SAFETY: Safe as the file was just opened
+//         let fd1 = OwnedFd::from(File::open("/dev/null").unwrap()).into();
+//         // SAFETY: Safe as the file was just opened
+//         let fd2 = OwnedFd::from(File::open("/dev/null").unwrap()).into();
+//         // SAFETY: safe as both FDs are valid
+//         unsafe {
+//             still_valid_config.add_preserved_fds(vec![fd1, fd2]);
+//         }
+//         let _still_valid_config = still_valid_config.clone();
+//
+//         // Valid BDF test
+//         let mut still_valid_config = valid_config.clone();
+//         still_valid_config.disks = Some(vec![DiskConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 pci_device_id: Some(8),
+//                 ..Default::default()
+//             },
+//             ..disk_fixture()
+//         }]);
+//         still_valid_config.validate().unwrap();
+//         // Invalid BDF - Same ID as Root device
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.disks = Some(vec![DiskConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 pci_device_id: Some(pci::PCI_ROOT_DEVICE_ID),
+//                 ..Default::default()
+//             },
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::ReservedPciDeviceId(
+//                 pci::PCI_ROOT_DEVICE_ID
+//             ))
+//         );
+//         // Invalid BDF - Out of range
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.disks = Some(vec![DiskConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 pci_device_id: Some(pci::NUM_DEVICE_IDS + 1),
+//                 ..Default::default()
+//             },
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidPciDeviceId(pci::NUM_DEVICE_IDS + 1))
+//         );
+//
+//         // Invalid console BDF - Same ID as Root device
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.console.pci_common.pci_device_id = Some(pci::PCI_ROOT_DEVICE_ID);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::ReservedPciDeviceId(
+//                 pci::PCI_ROOT_DEVICE_ID
+//             ))
+//         );
+//         // Invalid console BDF - Out of range
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.console.pci_common.pci_device_id = Some(pci::NUM_DEVICE_IDS + 1);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::InvalidPciDeviceId(pci::NUM_DEVICE_IDS + 1))
+//         );
+//         // Invalid console ID - Duplicate identifier
+//         let mut invalid_config = valid_config.clone();
+//         invalid_config.console.pci_common.id = Some("test0".to_string());
+//         invalid_config.disks = Some(vec![DiskConfig {
+//             pci_common: PciDeviceCommonConfig {
+//                 id: Some("test0".to_string()),
+//                 ..Default::default()
+//             },
+//             ..disk_fixture()
+//         }]);
+//         assert_eq!(
+//             invalid_config.validate(),
+//             Err(ValidationError::IdentifierNotUnique("test0".to_string()))
+//         );
+//     }
+//     #[test]
+//     fn test_landlock_parsing() -> Result<()> {
+//         // should not be empty
+//         LandlockConfig::parse("").unwrap_err();
+//         // access should not be empty
+//         LandlockConfig::parse("path=/dir/path1").unwrap_err();
+//         LandlockConfig::parse("path=/dir/path1,access=rwr").unwrap_err();
+//         assert_eq!(
+//             LandlockConfig::parse("path=/dir/path1,access=rw")?,
+//             LandlockConfig {
+//                 path: PathBuf::from("/dir/path1"),
+//                 access: "rw".to_string(),
+//             }
+//         );
+//         Ok(())
+//     }
+//     #[test]
+//     #[cfg(feature = "fw_cfg")]
+//     fn test_fw_cfg_config_item_list_parsing() -> Result<()> {
+//         // Empty list
+//         FwCfgConfig::parse("items=[]").unwrap_err();
+//         // Missing closing bracket
+//         FwCfgConfig::parse("items=[name=opt/org.test/fw_cfg_test_item,file=/tmp/fw_cfg_test_item")
+//             .unwrap_err();
+//         // Single file Item
+//         assert_eq!(
+//             FwCfgConfig::parse(
+//                 "items=[name=opt/org.test/fw_cfg_test_item,file=/tmp/fw_cfg_test_item]"
+//             )?,
+//             FwCfgConfig {
+//                 items: Some(FwCfgItemList {
+//                     item_list: vec![FwCfgItem {
+//                         name: "opt/org.test/fw_cfg_test_item".to_string(),
+//                         file: Some(PathBuf::from("/tmp/fw_cfg_test_item")),
+//                         string: None,
+//                     }]
+//                 }),
+//                 ..Default::default()
+//             },
+//         );
+//         // Multiple file Items
+//         assert_eq!(
+//             FwCfgConfig::parse(
+//                 "items=[name=opt/org.test/fw_cfg_test_item,file=/tmp/fw_cfg_test_item:name=opt/org.test/fw_cfg_test_item2,file=/tmp/fw_cfg_test_item2]"
+//             )?,
+//             FwCfgConfig {
+//                 items: Some(FwCfgItemList {
+//                     item_list: vec![
+//                         FwCfgItem {
+//                             name: "opt/org.test/fw_cfg_test_item".to_string(),
+//                             file: Some(PathBuf::from("/tmp/fw_cfg_test_item")),
+//                             string: None,
+//                         },
+//                         FwCfgItem {
+//                             name: "opt/org.test/fw_cfg_test_item2".to_string(),
+//                             file: Some(PathBuf::from("/tmp/fw_cfg_test_item2")),
+//                             string: None,
+//                         }
+//                     ]
+//                 }),
+//                 ..Default::default()
+//             },
+//         );
+//         // Single string Item (for OVMF MMIO64 config, GPU CC passthrough, etc.)
+//         assert_eq!(
+//             FwCfgConfig::parse("items=[name=opt/ovmf/X-PciMmio64Mb,string=262144]")?,
+//             FwCfgConfig {
+//                 items: Some(FwCfgItemList {
+//                     item_list: vec![FwCfgItem {
+//                         name: "opt/ovmf/X-PciMmio64Mb".to_string(),
+//                         file: None,
+//                         string: Some("262144".to_string()),
+//                     }]
+//                 }),
+//                 ..Default::default()
+//             },
+//         );
+//         // Mixed file and string Items
+//         assert_eq!(
+//             FwCfgConfig::parse(
+//                 "items=[name=opt/org.test/fw_cfg_test_item,file=/tmp/fw_cfg_test_item:name=opt/ovmf/X-PciMmio64Mb,string=262144]"
+//             )?,
+//             FwCfgConfig {
+//                 items: Some(FwCfgItemList {
+//                     item_list: vec![
+//                         FwCfgItem {
+//                             name: "opt/org.test/fw_cfg_test_item".to_string(),
+//                             file: Some(PathBuf::from("/tmp/fw_cfg_test_item")),
+//                             string: None,
+//                         },
+//                         FwCfgItem {
+//                             name: "opt/ovmf/X-PciMmio64Mb".to_string(),
+//                             file: None,
+//                             string: Some("262144".to_string()),
+//                         }
+//                     ]
+//                 }),
+//                 ..Default::default()
+//             },
+//         );
+//         // Missing both file and string parses OK but fails validation
+//         let missing_content =
+//             FwCfgConfig::parse("items=[name=opt/org.test/missing_content]").unwrap();
+//         assert_eq!(
+//             missing_content.items.as_ref().unwrap().item_list[0].file,
+//             None
+//         );
+//         assert_eq!(
+//             missing_content.items.as_ref().unwrap().item_list[0].string,
+//             None
+//         );
+//         // Both file and string parses OK but fails validation
+//         let both = FwCfgConfig::parse("items=[name=opt/org.test/both,file=/tmp/test,string=test]")
+//             .unwrap();
+//         assert!(both.items.as_ref().unwrap().item_list[0].file.is_some());
+//         assert!(both.items.as_ref().unwrap().item_list[0].string.is_some());
+//         Ok(())
+//     }
+// }

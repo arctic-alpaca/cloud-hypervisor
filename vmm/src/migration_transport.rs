@@ -29,6 +29,7 @@ use vm_migration::protocol::{Command, MemoryRangeTable, Request, Response};
 use vm_migration::{MigratableError, Snapshot};
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::de_ser::Active;
 use crate::sync_utils::Gate;
 use crate::{GuestMemoryMmap, VmMigrationConfig};
 
@@ -849,7 +850,7 @@ pub(crate) fn send_request_expect_ok(
 /// Serialize and send the VM configuration payload.
 pub(crate) fn send_config(
     socket: &mut SocketStream,
-    config: &VmMigrationConfig,
+    config: &VmMigrationConfig<Active>,
 ) -> Result<(), MigratableError> {
     let config_data = serde_json::to_vec(config)
         .context("Error serializing VM migration config")

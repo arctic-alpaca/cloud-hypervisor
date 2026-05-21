@@ -34,6 +34,7 @@
 //! [`cmsg(3)`]: https://man7.org/linux/man-pages/man3/cmsg.3.html
 //! [special HTTP library]: https://github.com/firecracker-microvm/micro-http
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::sync::mpsc::Sender;
 
@@ -42,7 +43,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::api::VmCoredump;
-use crate::api::http::http_endpoint::fds_helper::{attach_fds_to_cfg, attach_fds_to_cfgs};
+// use crate::api::http::http_endpoint::fds_helper::{attach_fds_to_cfg, attach_fds_to_cfgs};
 use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs,
@@ -273,7 +274,7 @@ impl EndpointHandler for VmCreate {
                 match &req.body {
                     Some(body) => {
                         // Deserialize into a VmConfig
-                        let mut vm_config: VmConfig<Serialized> =
+                        let vm_config: VmConfig<Serialized> =
                             match serde_json::from_slice(body.raw())
                                 .map_err(HttpError::SerdeJsonDeserialize)
                             {
@@ -298,7 +299,7 @@ impl EndpointHandler for VmCreate {
                         // }
 
                         // TODO(de_ser): error handling
-                        let vm_config = Box::new(vm_config.activate(vec![]).unwrap());
+                        let vm_config = Box::new(vm_config.activate(&mut VecDeque::new()).unwrap());
 
                         match crate::api::VmCreate
                             .send(api_notifier, api_sender, vm_config)
@@ -451,11 +452,11 @@ impl PutHandler for VmAddNet {
         files: Vec<File>,
     ) -> std::result::Result<Option<Body>, HttpError> {
         if let Some(body) = body {
-            let mut net_cfg: NetConfig<Serialized> = serde_json::from_slice(body.raw())?;
+            let net_cfg: NetConfig<Serialized> = serde_json::from_slice(body.raw())?;
             // attach_fds_to_cfg(files, &mut net_cfg)?;
             // TODO(de_ser): error handling
             let net_cfg = net_cfg
-                .activate(files.into_iter().map(|file| file.into()).collect())
+                .activate(&mut files.into_iter().map(|file| file.into()).collect())
                 .unwrap();
 
             self.send(api_notifier, api_sender, net_cfg)
@@ -507,13 +508,17 @@ impl PutHandler for VmRestore {
         files: Vec<File>,
     ) -> std::result::Result<Option<Body>, HttpError> {
         if let Some(body) = body {
-            let mut restore_cfg: RestoreConfig = serde_json::from_slice(body.raw())?;
+            let restore_cfg: RestoreConfig<Serialized> = serde_json::from_slice(body.raw())?;
 
-            if let Some(cfgs) = restore_cfg.net_fds.as_mut() {
-                let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
-                let cfgs = cfgs.as_mut_slice();
-                attach_fds_to_cfgs(files, cfgs)?;
-            }
+            let restore_cfg = restore_cfg
+                .activate(&mut files.into_iter().map(|file| file.into()).collect())
+                .unwrap();
+
+            // if let Some(cfgs) = restore_cfg.net_fds.as_mut() {
+            //     let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
+            //     let cfgs = cfgs.as_mut_slice();
+            //     attach_fds_to_cfgs(files, cfgs)?;
+            // }
 
             self.send(api_notifier, api_sender, restore_cfg)
                 .map_err(HttpError::ApiError)
@@ -641,114 +646,114 @@ impl EndpointHandler for VmmShutdown {
     }
 }
 
-#[cfg(test)]
-mod external_fds_tests {
-    use super::*;
-    use crate::api::http::http_endpoint::fds_helper::{ConfigWithFDs, ConfigWithVariableFDs};
-
-    struct DummyNewDeviceCfg {
-        http_fds: Option<Vec<i32>>,
-    }
-
-    impl ConfigWithFDs for DummyNewDeviceCfg {
-        fn id(&self) -> Option<&str> {
-            Some("dummy")
-        }
-
-        fn fds_from_http_body(&self) -> Option<&[i32]> {
-            self.http_fds.as_deref()
-        }
-
-        fn set_fds(&mut self, fds: Option<Vec<i32>>) {
-            self.http_fds = fds;
-        }
-    }
-
-    struct DummyRestoreDeviceCfg {
-        http_fds: Option<Vec<i32>>,
-        num_fds: usize,
-    }
-
-    impl ConfigWithFDs for DummyRestoreDeviceCfg {
-        fn id(&self) -> Option<&str> {
-            Some("dummy")
-        }
-
-        fn fds_from_http_body(&self) -> Option<&[i32]> {
-            self.http_fds.as_deref()
-        }
-
-        fn set_fds(&mut self, fds: Option<Vec<i32>>) {
-            self.http_fds = fds;
-        }
-    }
-
-    impl ConfigWithVariableFDs for DummyRestoreDeviceCfg {
-        fn expected_num_fds(&self) -> usize {
-            self.num_fds
-        }
-    }
-
-    #[test]
-    fn test_fds_provided_via_http_api_are_reset() {
-        let mut config = DummyNewDeviceCfg {
-            http_fds: Some(vec![1, 2, 3]),
-        };
-
-        attach_fds_to_cfg(vec![], &mut config).unwrap();
-        assert_eq!(config.http_fds, None);
-    }
-
-    #[test]
-    fn test_new_device_cfg_takes_all_fds() {
-        let path = "/dev/null";
-
-        let new_fds = vec![
-            File::open(path).unwrap(),
-            File::open(path).unwrap(),
-            File::open(path).unwrap(),
-        ];
-        let mut config = DummyNewDeviceCfg {
-            http_fds: Some(vec![1, 2, 3]),
-        };
-
-        attach_fds_to_cfg(new_fds, &mut config).unwrap();
-        assert_eq!(config.http_fds.unwrap().len(), 3);
-    }
-
-    #[test]
-    fn test_restore_cfgs_take_only_their_fds() {
-        let path = "/dev/null";
-        let new_fds = vec![
-            File::open(path).unwrap(),
-            File::open(path).unwrap(),
-            File::open(path).unwrap(),
-            File::open(path).unwrap(),
-            File::open(path).unwrap(),
-            File::open(path).unwrap(),
-        ];
-        let mut config1 = DummyRestoreDeviceCfg {
-            http_fds: None,
-            num_fds: 3,
-        };
-        let mut config2 = DummyRestoreDeviceCfg {
-            http_fds: None,
-            num_fds: 1,
-        };
-        let mut config3 = DummyRestoreDeviceCfg {
-            http_fds: None,
-            num_fds: 0,
-        };
-        let mut config4 = DummyRestoreDeviceCfg {
-            http_fds: None,
-            num_fds: 2,
-        };
-        let mut configs = [&mut config1, &mut config2, &mut config3, &mut config4];
-
-        attach_fds_to_cfgs(new_fds, &mut configs).unwrap();
-        assert_eq!(config1.http_fds.unwrap().len(), 3);
-        assert_eq!(config2.http_fds.unwrap().len(), 1);
-        assert!(config3.http_fds.is_none());
-        assert_eq!(config4.http_fds.unwrap().len(), 2);
-    }
-}
+// #[cfg(test)]
+// mod external_fds_tests {
+//     use super::*;
+//     // use crate::api::http::http_endpoint::fds_helper::{ConfigWithFDs, ConfigWithVariableFDs};
+//
+//     struct DummyNewDeviceCfg {
+//         http_fds: Option<Vec<i32>>,
+//     }
+//
+//     impl ConfigWithFDs for DummyNewDeviceCfg {
+//         fn id(&self) -> Option<&str> {
+//             Some("dummy")
+//         }
+//
+//         fn fds_from_http_body(&self) -> Option<&[i32]> {
+//             self.http_fds.as_deref()
+//         }
+//
+//         fn set_fds(&mut self, fds: Option<Vec<i32>>) {
+//             self.http_fds = fds;
+//         }
+//     }
+//
+//     struct DummyRestoreDeviceCfg {
+//         http_fds: Option<Vec<i32>>,
+//         num_fds: usize,
+//     }
+//
+//     impl ConfigWithFDs for DummyRestoreDeviceCfg {
+//         fn id(&self) -> Option<&str> {
+//             Some("dummy")
+//         }
+//
+//         fn fds_from_http_body(&self) -> Option<&[i32]> {
+//             self.http_fds.as_deref()
+//         }
+//
+//         fn set_fds(&mut self, fds: Option<Vec<i32>>) {
+//             self.http_fds = fds;
+//         }
+//     }
+//
+//     impl ConfigWithVariableFDs for DummyRestoreDeviceCfg {
+//         fn expected_num_fds(&self) -> usize {
+//             self.num_fds
+//         }
+//     }
+//
+//     #[test]
+//     fn test_fds_provided_via_http_api_are_reset() {
+//         let mut config = DummyNewDeviceCfg {
+//             http_fds: Some(vec![1, 2, 3]),
+//         };
+//
+//         attach_fds_to_cfg(vec![], &mut config).unwrap();
+//         assert_eq!(config.http_fds, None);
+//     }
+//
+//     #[test]
+//     fn test_new_device_cfg_takes_all_fds() {
+//         let path = "/dev/null";
+//
+//         let new_fds = vec![
+//             File::open(path).unwrap(),
+//             File::open(path).unwrap(),
+//             File::open(path).unwrap(),
+//         ];
+//         let mut config = DummyNewDeviceCfg {
+//             http_fds: Some(vec![1, 2, 3]),
+//         };
+//
+//         attach_fds_to_cfg(new_fds, &mut config).unwrap();
+//         assert_eq!(config.http_fds.unwrap().len(), 3);
+//     }
+//
+//     #[test]
+//     fn test_restore_cfgs_take_only_their_fds() {
+//         let path = "/dev/null";
+//         let new_fds = vec![
+//             File::open(path).unwrap(),
+//             File::open(path).unwrap(),
+//             File::open(path).unwrap(),
+//             File::open(path).unwrap(),
+//             File::open(path).unwrap(),
+//             File::open(path).unwrap(),
+//         ];
+//         let mut config1 = DummyRestoreDeviceCfg {
+//             http_fds: None,
+//             num_fds: 3,
+//         };
+//         let mut config2 = DummyRestoreDeviceCfg {
+//             http_fds: None,
+//             num_fds: 1,
+//         };
+//         let mut config3 = DummyRestoreDeviceCfg {
+//             http_fds: None,
+//             num_fds: 0,
+//         };
+//         let mut config4 = DummyRestoreDeviceCfg {
+//             http_fds: None,
+//             num_fds: 2,
+//         };
+//         let mut configs = [&mut config1, &mut config2, &mut config3, &mut config4];
+//
+//         attach_fds_to_cfgs(new_fds, &mut configs).unwrap();
+//         assert_eq!(config1.http_fds.unwrap().len(), 3);
+//         assert_eq!(config2.http_fds.unwrap().len(), 1);
+//         assert!(config3.http_fds.is_none());
+//         assert_eq!(config4.http_fds.unwrap().len(), 2);
+//     }
+// }

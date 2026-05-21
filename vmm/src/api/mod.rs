@@ -52,6 +52,7 @@ pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
 use crate::config::RestoreConfig;
+use crate::de_ser::Active;
 use crate::device_tree::DeviceTree;
 use crate::migration_transport::MAX_MIGRATION_CONNECTIONS;
 use crate::vm::{Error as VmError, VmState};
@@ -214,8 +215,9 @@ pub enum ApiError {
 pub type ApiResult<T> = Result<T, ApiError>;
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(bound(deserialize = "VmConfig<Active>: Deserialize<'de>",))]
 pub struct VmInfoResponse {
-    pub config: Box<VmConfig>,
+    pub config: Box<VmConfig<Active>>,
     pub state: VmState,
     pub memory_actual_size: u64,
     pub device_tree: Option<DeviceTree>,
@@ -505,7 +507,7 @@ pub enum ApiResponsePayload {
 pub type ApiResponse = Result<ApiResponsePayload, ApiError>;
 
 pub trait RequestHandler {
-    fn vm_create(&mut self, config: Box<VmConfig>) -> Result<(), VmError>;
+    fn vm_create(&mut self, config: Box<VmConfig<Active>>) -> Result<(), VmError>;
 
     fn vm_boot(&mut self) -> Result<(), VmError>;
 
@@ -515,7 +517,7 @@ pub trait RequestHandler {
 
     fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
 
-    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
+    fn vm_restore(&mut self, restore_cfg: RestoreConfig<Active>) -> Result<(), VmError>;
 
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     fn vm_coredump(&mut self, destination_url: &str) -> Result<(), VmError>;
@@ -563,7 +565,7 @@ pub trait RequestHandler {
 
     fn vm_add_pmem(&mut self, pmem_cfg: PmemConfig) -> Result<Option<Vec<u8>>, VmError>;
 
-    fn vm_add_net(&mut self, net_cfg: NetConfig) -> Result<Option<Vec<u8>>, VmError>;
+    fn vm_add_net(&mut self, net_cfg: NetConfig<Active>) -> Result<Option<Vec<u8>>, VmError>;
 
     fn vm_add_vdpa(&mut self, vdpa_cfg: VdpaConfig) -> Result<Option<Vec<u8>>, VmError>;
 
@@ -837,7 +839,7 @@ impl ApiAction for VmAddPmem {
 pub struct VmAddNet;
 
 impl ApiAction for VmAddNet {
-    type RequestBody = NetConfig;
+    type RequestBody = NetConfig<Active>;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -1090,7 +1092,7 @@ impl ApiAction for VmCounters {
 pub struct VmCreate;
 
 impl ApiAction for VmCreate {
-    type RequestBody = Box<VmConfig>;
+    type RequestBody = Box<VmConfig<Active>>;
     type ResponseBody = ();
 
     fn request(
@@ -1482,7 +1484,7 @@ impl ApiAction for VmResizeZone {
 pub struct VmRestore;
 
 impl ApiAction for VmRestore {
-    type RequestBody = RestoreConfig;
+    type RequestBody = RestoreConfig<Active>;
     type ResponseBody = Option<Body>;
 
     fn request(

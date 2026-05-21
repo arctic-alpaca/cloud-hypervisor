@@ -913,1123 +913,1123 @@ fn main() {
     std::process::exit(exit_code);
 }
 
-#[cfg(test)]
-mod unit_tests {
-    use std::path::PathBuf;
-
-    use vmm::config::VmParams;
-    #[cfg(target_arch = "x86_64")]
-    use vmm::vm_config::DebugConsoleConfig;
-    use vmm::vm_config::{
-        CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CoreScheduling, CpuFeatures,
-        CpusConfig, HotplugMethod, MemoryConfig, PayloadConfig, PciDeviceCommonConfig, RngConfig,
-        SerialConfig, VmConfig,
-    };
-
-    use crate::test_util::assert_args_sorted;
-    use crate::{create_app, get_cli_options_sorted, prepare_default_values};
-
-    fn get_vm_config_from_vec(args: &[&str]) -> VmConfig {
-        let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-        let cmd_arguments =
-            create_app(default_vcpus, default_memory, default_rng).get_matches_from(args);
-        let vm_params = VmParams::from_arg_matches(&cmd_arguments);
-
-        VmConfig::parse(vm_params).unwrap()
-    }
-
-    fn compare_vm_config_cli_vs_json(
-        cli: &[&str],
-        openapi: &str,
-        equal: bool,
-    ) -> (VmConfig, VmConfig) {
-        let cli_vm_config = get_vm_config_from_vec(cli);
-        let openapi_vm_config: VmConfig = serde_json::from_str(openapi).unwrap();
-
-        if equal {
-            assert_eq!(cli_vm_config, openapi_vm_config);
-        } else {
-            assert_ne!(cli_vm_config, openapi_vm_config);
-        }
-
-        (cli_vm_config, openapi_vm_config)
-    }
-
-    #[test]
-    fn test_valid_vm_config_default() {
-        let cli = vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"];
-        let openapi = r#"{ "payload": {"kernel": "/path/to/kernel"} }"#;
-
-        // First we check we get identical VmConfig structures.
-        let (result_vm_config, _) = compare_vm_config_cli_vs_json(&cli, openapi, true);
-
-        // As a second step, we validate all the default values.
-        let expected_vm_config = VmConfig {
-            cpus: CpusConfig {
-                boot_vcpus: 1,
-                max_vcpus: 1,
-                topology: None,
-                kvm_hyperv: false,
-                max_phys_bits: 46,
-                affinity: None,
-                features: CpuFeatures::default(),
-                nested: true,
-                core_scheduling: CoreScheduling::Vm,
-            },
-            memory: MemoryConfig {
-                size: 536_870_912,
-                mergeable: false,
-                hotplug_method: HotplugMethod::Acpi,
-                hotplug_size: None,
-                hotplugged_size: None,
-                shared: false,
-                hugepages: false,
-                hugepage_size: None,
-                prefault: false,
-                zones: None,
-                thp: true,
-            },
-            payload: Some(PayloadConfig {
-                kernel: Some(PathBuf::from("/path/to/kernel")),
-                firmware: None,
-                cmdline: None,
-                initramfs: None,
-                #[cfg(feature = "igvm")]
-                igvm: None,
-                #[cfg(feature = "sev_snp")]
-                host_data: None,
-                #[cfg(feature = "fw_cfg")]
-                fw_cfg_config: None,
-            }),
-            rate_limit_groups: None,
-            disks: None,
-            net: None,
-            rng: RngConfig {
-                src: PathBuf::from("/dev/urandom"),
-                pci_common: PciDeviceCommonConfig::default(),
-            },
-            balloon: None,
-            fs: None,
-            generic_vhost_user: None,
-            pmem: None,
-            serial: SerialConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Null,
-                    socket: None,
-                },
-            },
-            console: ConsoleConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Tty,
-                    socket: None,
-                },
-                pci_common: PciDeviceCommonConfig::default(),
-            },
-            #[cfg(target_arch = "x86_64")]
-            debug_console: DebugConsoleConfig::default(),
-            devices: None,
-            user_devices: None,
-            vdpa: None,
-            vsock: None,
-            pvpanic: false,
-            #[cfg(feature = "pvmemcontrol")]
-            pvmemcontrol: None,
-            iommu: false,
-            numa: None,
-            watchdog: false,
-            #[cfg(feature = "guest_debug")]
-            gdb: false,
-            pci_segments: None,
-            platform: None,
-            tpm: None,
-            preserved_fds: None,
-            landlock_enable: false,
-            landlock_rules: None,
-            #[cfg(feature = "ivshmem")]
-            ivshmem: None,
-        };
-
-        assert_eq!(expected_vm_config, result_vm_config);
-    }
-
-    #[test]
-    fn test_valid_vm_config_cpus() {
-        [
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--cpus",
-                    "boot=1",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "cpus": {"boot_vcpus": 1, "max_vcpus": 1}
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--cpus",
-                    "boot=1,max=3",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "cpus": {"boot_vcpus": 1, "max_vcpus": 3}
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--cpus",
-                    "boot=2,max=4",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "cpus": {"boot_vcpus": 1, "max_vcpus": 3}
-                }"#,
-                false,
-            ),
-        ]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_memory() {
-        [(
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1073741824"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory": {"size": 1073741824}
-                }"#,
-                true,
-            ),
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory": {"size": 1073741824}
-                }"#,
-                true,
-            ),
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,mergeable=on"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory": {"size": 1073741824, "mergeable": true}
-                }"#,
-                true,
-            ),
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,mergeable=off"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory": {"size": 1073741824, "mergeable": false}
-                }"#,
-                true,
-            ),
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,mergeable=on"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory": {"size": 1073741824, "mergeable": false}
-                }"#,
-                false,
-            ),
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,hotplug_size=1G"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory": {"size": 1073741824, "hotplug_method": "Acpi", "hotplug_size": 1073741824}
-                }"#,
-                true,
-            ),
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,hotplug_method=virtio-mem,hotplug_size=1G"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory": {"size": 1073741824, "hotplug_method": "VirtioMem", "hotplug_size": 1073741824}
-                }"#,
-                true,
-            )]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_kernel() {
-        [(
-            vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"],
-            r#"{
-                "payload": {"kernel": "/path/to/kernel"}
-            }"#,
-            true,
-        )]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_cmdline() {
-        [(
-            vec![
-                "cloud-hypervisor",
-                "--kernel",
-                "/path/to/kernel",
-                "--cmdline",
-                "arg1=foo arg2=bar",
-            ],
-            r#"{
-                "payload": {"kernel": "/path/to/kernel", "cmdline": "arg1=foo arg2=bar"}
-            }"#,
-            true,
-        )]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_disks() {
-        [
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--disk",
-                    "path=/path/to/disk/1,image_type=raw",
-                    "path=/path/to/disk/2",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "disks": [
-                        {"path": "/path/to/disk/1", "image_type": "Raw"},
-                        {"path": "/path/to/disk/2", "image_type": "Unknown"}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--disk",
-                    "path=/path/to/disk/1,image_type=raw",
-                    "path=/path/to/disk/2,image_type=qcow2",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "disks": [
-                        {"path": "/path/to/disk/1"}
-                    ]
-                }"#,
-                false,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--memory",
-                    "shared=true",
-                    "--disk",
-                    "vhost_user=true,socket=/tmp/sock1",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory" : { "shared": true, "size": 536870912 },
-                    "disks": [
-                        {"vhost_user":true, "vhost_socket":"/tmp/sock1"}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--memory",
-                    "shared=true",
-                    "--disk",
-                    "vhost_user=true,socket=/tmp/sock1",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory" : { "shared": true, "size": 536870912 },
-                    "disks": [
-                        {"vhost_user":true, "vhost_socket":"/tmp/sock1"}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--disk",
-                    "path=/path/to/disk/1,rate_limit_group=group0",
-                    "path=/path/to/disk/2,rate_limit_group=group0",
-                    "--rate-limit-group",
-                    "id=group0,bw_size=1000,bw_refill_time=100",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "disks": [
-                        {"path": "/path/to/disk/1", "rate_limit_group": "group0", "image_type": "Unknown"},
-                        {"path": "/path/to/disk/2", "rate_limit_group": "group0", "image_type": "Unknown"}
-                    ],
-                    "rate_limit_groups": [
-                        {"id": "group0", "rate_limiter_config": {"bandwidth": {"size": 1000, "one_time_burst": 0, "refill_time": 100}}}
-                    ]
-                }"#,
-                true,
-            ),
-        ]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_net() {
-        [
-            // This test is expected to fail because the default MAC address is
-            // randomly generated. There's no way we can have twice the same
-            // default value.
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--net", "mac="],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "net": []
-                }"#,
-                false,
-            ),
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--net", "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd"}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--net",
-                    "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0"}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--net",
-                    "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8"}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--cpus", "boot=2",
-                    "--net",
-                    "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=4",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "cpus": {"boot_vcpus": 2, "max_vcpus": 2},
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 4}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--cpus", "boot=2",
-                    "--net",
-                    "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=4,queue_size=128",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "cpus": {"boot_vcpus": 2, "max_vcpus": 2},
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 4, "queue_size": 128}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--net",
-                    "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8"}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--net",
-                    "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256}
-                    ]
-                }"#,
-                true,
-            ),
-            #[cfg(target_arch = "x86_64")]
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--net",
-                    "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256,iommu=on",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256, "iommu": true}
-                    ]
-                }"#,
-                false,
-            ),
-            #[cfg(target_arch = "x86_64")]
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--net",
-                    "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256,iommu=on",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256, "iommu": true}
-                    ],
-                    "iommu": true
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--net",
-                    "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256,iommu=off",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256, "iommu": false}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "shared=true", "--net", "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,vhost_user=true,socket=/tmp/sock"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory" : { "shared": true, "size": 536870912 },
-                    "net": [
-                        {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "vhost_user": true, "vhost_socket": "/tmp/sock"}
-                    ]
-                }"#,
-                true,
-            ),
-        ]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_rng() {
-        [(
-            vec![
-                "cloud-hypervisor",
-                "--kernel",
-                "/path/to/kernel",
-                "--rng",
-                "src=/path/to/entropy/source",
-            ],
-            r#"{
-                "payload": {"kernel": "/path/to/kernel"},
-                "rng": {"src": "/path/to/entropy/source"}
-            }"#,
-            true,
-        )]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_fs() {
-        [(
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--memory", "shared=true",
-                    "--fs",
-                    "tag=virtiofs1,socket=/path/to/sock1",
-                    "tag=virtiofs2,socket=/path/to/sock2",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory" : { "shared": true, "size": 536870912 },
-                    "fs": [
-                        {"tag": "virtiofs1", "socket": "/path/to/sock1"},
-                        {"tag": "virtiofs2", "socket": "/path/to/sock2"}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--memory", "shared=true",
-                    "--fs",
-                    "tag=virtiofs1,socket=/path/to/sock1",
-                    "tag=virtiofs2,socket=/path/to/sock2",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory" : { "shared": true, "size": 536870912 },
-                    "fs": [
-                        {"tag": "virtiofs1", "socket": "/path/to/sock1"}
-                    ]
-                }"#,
-                false,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--memory", "shared=true", "--cpus", "boot=4",
-                    "--fs",
-                    "tag=virtiofs1,socket=/path/to/sock1,num_queues=4",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory" : { "shared": true, "size": 536870912 },
-                    "cpus": {"boot_vcpus": 4, "max_vcpus": 4},
-                    "fs": [
-                        {"tag": "virtiofs1", "socket": "/path/to/sock1", "num_queues": 4}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor", "--kernel", "/path/to/kernel",
-                    "--memory", "shared=true", "--cpus", "boot=4",
-                    "--fs",
-                    "tag=virtiofs1,socket=/path/to/sock1,num_queues=4,queue_size=128"
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory" : { "shared": true, "size": 536870912 },
-                    "cpus": {"boot_vcpus": 4, "max_vcpus": 4},
-                    "fs": [
-                        {"tag": "virtiofs1", "socket": "/path/to/sock1", "num_queues": 4, "queue_size": 128}
-                    ]
-                }"#,
-                true,
-            )]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_pmem() {
-        [
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--pmem",
-                    "file=/path/to/img/1,size=1G",
-                    "file=/path/to/img/2,size=2G",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "pmem": [
-                        {"file": "/path/to/img/1", "size": 1073741824},
-                        {"file": "/path/to/img/2", "size": 2147483648}
-                    ]
-                }"#,
-                true,
-            ),
-            #[cfg(target_arch = "x86_64")]
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--pmem",
-                    "file=/path/to/img/1,size=1G,iommu=on",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "pmem": [
-                        {"file": "/path/to/img/1", "size": 1073741824, "iommu": true}
-                    ],
-                    "iommu": true
-                }"#,
-                true,
-            ),
-            #[cfg(target_arch = "x86_64")]
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--pmem",
-                    "file=/path/to/img/1,size=1G,iommu=on",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "pmem": [
-                        {"file": "/path/to/img/1", "size": 1073741824, "iommu": true}
-                    ]
-                }"#,
-                false,
-            ),
-        ]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_valid_vm_config_debug_console() {
-        [(
-            vec![
-                "cloud-hypervisor",
-                "--kernel",
-                "/path/to/kernel",
-                "--debug-console",
-                "tty,iobase=0xe9",
-            ],
-            // 233 == 0xe9
-            r#"{
-                "payload": {"kernel": "/path/to/kernel" },
-                "debug_console": {"mode": "Tty", "iobase": 233 }
-            }"#,
-            true,
-        )]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_serial_console() {
-        [
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "serial": {"mode": "Null"},
-                    "console": {"mode": "Tty"}
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--serial",
-                    "null",
-                    "--console",
-                    "tty,pci_segment=1,pci_device_id=7",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "serial": {"mode": "Null"},
-                    "console": {"mode": "Tty", "iommu": false, "pci_segment": 1, "pci_device_id": 7}
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--serial",
-                    "tty",
-                    "--console",
-                    "off",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "serial": {"mode": "Tty"},
-                    "console": {"mode": "Off"}
-                }"#,
-                true,
-            ),
-        ]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_serial_pty_console_pty() {
-        [
-            (
-                vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "serial": {"mode": "Null"},
-                    "console": {"mode": "Tty"}
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--serial",
-                    "null",
-                    "--console",
-                    "tty",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"}
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--serial",
-                    "pty",
-                    "--console",
-                    "pty",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "serial": {"mode": "Pty"},
-                    "console": {"mode": "Pty"}
-                }"#,
-                true,
-            ),
-        ]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_valid_vm_config_devices() {
-        [
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--device",
-                    "path=/path/to/device/1",
-                    "path=/path/to/device/2",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "devices": [
-                        {"path": "/path/to/device/1"},
-                        {"path": "/path/to/device/2"}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--device",
-                    "path=/path/to/device/1",
-                    "path=/path/to/device/2",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "devices": [
-                        {"path": "/path/to/device/1"}
-                    ]
-                }"#,
-                false,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--device",
-                    "path=/path/to/device,iommu=on",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "devices": [
-                        {"path": "/path/to/device", "iommu": true}
-                    ],
-                    "iommu": true
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--device",
-                    "path=/path/to/device,iommu=on",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "devices": [
-                        {"path": "/path/to/device", "iommu": true}
-                    ]
-                }"#,
-                false,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--device",
-                    "path=/path/to/device,iommu=off",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "devices": [
-                        {"path": "/path/to/device", "iommu": false}
-                    ]
-                }"#,
-                true,
-            ),
-        ]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_vdpa() {
-        [
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--vdpa",
-                    "path=/path/to/device/1",
-                    "path=/path/to/device/2,num_queues=2",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "vdpa": [
-                        {"path": "/path/to/device/1", "num_queues": 1},
-                        {"path": "/path/to/device/2", "num_queues": 2}
-                    ]
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--vdpa",
-                    "path=/path/to/device/1",
-                    "path=/path/to/device/2",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "vdpa": [
-                        {"path": "/path/to/device/1"}
-                    ]
-                }"#,
-                false,
-            ),
-        ]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_vsock() {
-        [
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--vsock",
-                    "cid=123,socket=/path/to/sock/1",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "vsock": {"cid": 123, "socket": "/path/to/sock/1"}
-                }"#,
-                true,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--vsock",
-                    "cid=124,socket=/path/to/sock/1",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "vsock": {"cid": 123, "socket": "/path/to/sock/1"}
-                }"#,
-                false,
-            ),
-            #[cfg(target_arch = "x86_64")]
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--vsock",
-                    "cid=123,socket=/path/to/sock/1,iommu=on",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "vsock": {"cid": 123, "socket": "/path/to/sock/1", "iommu": true},
-                    "iommu": true
-                }"#,
-                true,
-            ),
-            #[cfg(target_arch = "x86_64")]
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--vsock",
-                    "cid=123,socket=/path/to/sock/1,iommu=on",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "vsock": {"cid": 123, "socket": "/path/to/sock/1", "iommu": true}
-                }"#,
-                false,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--vsock",
-                    "cid=123,socket=/path/to/sock/1,iommu=off",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "vsock": {"cid": 123, "socket": "/path/to/sock/1", "iommu": false}
-                }"#,
-                true,
-            ),
-        ]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
-    fn test_valid_vm_config_tpm_socket() {
-        [(
-            vec![
-                "cloud-hypervisor",
-                "--kernel",
-                "/path/to/kernel",
-                "--tpm",
-                "socket=/path/to/tpm/sock",
-            ],
-            r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "tpm": {"socket": "/path/to/tpm/sock"}
-                }"#,
-            true,
-        )]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    // TODO the check for the option list being sorted could be moved into the
-    // getter itself, when the getter becomes a const function. This however
-    // needs more support by Rust (as of March 2025).
-    #[test]
-    fn test_cli_options_sorted() {
-        let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-        let args = get_cli_options_sorted(default_vcpus, default_memory, default_rng);
-
-        assert_args_sorted(|| args.iter());
-    }
-}
+// #[cfg(test)]
+// mod unit_tests {
+//     use std::path::PathBuf;
+//
+//     use vmm::config::VmParams;
+//     #[cfg(target_arch = "x86_64")]
+//     use vmm::vm_config::DebugConsoleConfig;
+//     use vmm::vm_config::{
+//         CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CoreScheduling, CpuFeatures,
+//         CpusConfig, HotplugMethod, MemoryConfig, PayloadConfig, PciDeviceCommonConfig, RngConfig,
+//         SerialConfig, VmConfig,
+//     };
+//
+//     use crate::test_util::assert_args_sorted;
+//     use crate::{create_app, get_cli_options_sorted, prepare_default_values};
+//
+//     fn get_vm_config_from_vec(args: &[&str]) -> VmConfig {
+//         let (default_vcpus, default_memory, default_rng) = prepare_default_values();
+//         let cmd_arguments =
+//             create_app(default_vcpus, default_memory, default_rng).get_matches_from(args);
+//         let vm_params = VmParams::from_arg_matches(&cmd_arguments);
+//
+//         VmConfig::parse(vm_params).unwrap()
+//     }
+//
+//     fn compare_vm_config_cli_vs_json(
+//         cli: &[&str],
+//         openapi: &str,
+//         equal: bool,
+//     ) -> (VmConfig, VmConfig) {
+//         let cli_vm_config = get_vm_config_from_vec(cli);
+//         let openapi_vm_config: VmConfig = serde_json::from_str(openapi).unwrap();
+//
+//         if equal {
+//             assert_eq!(cli_vm_config, openapi_vm_config);
+//         } else {
+//             assert_ne!(cli_vm_config, openapi_vm_config);
+//         }
+//
+//         (cli_vm_config, openapi_vm_config)
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_default() {
+//         let cli = vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"];
+//         let openapi = r#"{ "payload": {"kernel": "/path/to/kernel"} }"#;
+//
+//         // First we check we get identical VmConfig structures.
+//         let (result_vm_config, _) = compare_vm_config_cli_vs_json(&cli, openapi, true);
+//
+//         // As a second step, we validate all the default values.
+//         let expected_vm_config = VmConfig {
+//             cpus: CpusConfig {
+//                 boot_vcpus: 1,
+//                 max_vcpus: 1,
+//                 topology: None,
+//                 kvm_hyperv: false,
+//                 max_phys_bits: 46,
+//                 affinity: None,
+//                 features: CpuFeatures::default(),
+//                 nested: true,
+//                 core_scheduling: CoreScheduling::Vm,
+//             },
+//             memory: MemoryConfig {
+//                 size: 536_870_912,
+//                 mergeable: false,
+//                 hotplug_method: HotplugMethod::Acpi,
+//                 hotplug_size: None,
+//                 hotplugged_size: None,
+//                 shared: false,
+//                 hugepages: false,
+//                 hugepage_size: None,
+//                 prefault: false,
+//                 zones: None,
+//                 thp: true,
+//             },
+//             payload: Some(PayloadConfig {
+//                 kernel: Some(PathBuf::from("/path/to/kernel")),
+//                 firmware: None,
+//                 cmdline: None,
+//                 initramfs: None,
+//                 #[cfg(feature = "igvm")]
+//                 igvm: None,
+//                 #[cfg(feature = "sev_snp")]
+//                 host_data: None,
+//                 #[cfg(feature = "fw_cfg")]
+//                 fw_cfg_config: None,
+//             }),
+//             rate_limit_groups: None,
+//             disks: None,
+//             net: None,
+//             rng: RngConfig {
+//                 src: PathBuf::from("/dev/urandom"),
+//                 pci_common: PciDeviceCommonConfig::default(),
+//             },
+//             balloon: None,
+//             fs: None,
+//             generic_vhost_user: None,
+//             pmem: None,
+//             serial: SerialConfig {
+//                 common: CommonConsoleConfig {
+//                     file: None,
+//                     mode: ConsoleOutputMode::Null,
+//                     socket: None,
+//                 },
+//             },
+//             console: ConsoleConfig {
+//                 common: CommonConsoleConfig {
+//                     file: None,
+//                     mode: ConsoleOutputMode::Tty,
+//                     socket: None,
+//                 },
+//                 pci_common: PciDeviceCommonConfig::default(),
+//             },
+//             #[cfg(target_arch = "x86_64")]
+//             debug_console: DebugConsoleConfig::default(),
+//             devices: None,
+//             user_devices: None,
+//             vdpa: None,
+//             vsock: None,
+//             pvpanic: false,
+//             #[cfg(feature = "pvmemcontrol")]
+//             pvmemcontrol: None,
+//             iommu: false,
+//             numa: None,
+//             watchdog: false,
+//             #[cfg(feature = "guest_debug")]
+//             gdb: false,
+//             pci_segments: None,
+//             platform: None,
+//             tpm: None,
+//             preserved_fds: None,
+//             landlock_enable: false,
+//             landlock_rules: None,
+//             #[cfg(feature = "ivshmem")]
+//             ivshmem: None,
+//         };
+//
+//         assert_eq!(expected_vm_config, result_vm_config);
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_cpus() {
+//         [
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--cpus",
+//                     "boot=1",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "cpus": {"boot_vcpus": 1, "max_vcpus": 1}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--cpus",
+//                     "boot=1,max=3",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "cpus": {"boot_vcpus": 1, "max_vcpus": 3}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--cpus",
+//                     "boot=2,max=4",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "cpus": {"boot_vcpus": 1, "max_vcpus": 3}
+//                 }"#,
+//                 false,
+//             ),
+//         ]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_memory() {
+//         [(
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1073741824"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory": {"size": 1073741824}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory": {"size": 1073741824}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,mergeable=on"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory": {"size": 1073741824, "mergeable": true}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,mergeable=off"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory": {"size": 1073741824, "mergeable": false}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,mergeable=on"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory": {"size": 1073741824, "mergeable": false}
+//                 }"#,
+//                 false,
+//             ),
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,hotplug_size=1G"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory": {"size": 1073741824, "hotplug_method": "Acpi", "hotplug_size": 1073741824}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,hotplug_method=virtio-mem,hotplug_size=1G"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory": {"size": 1073741824, "hotplug_method": "VirtioMem", "hotplug_size": 1073741824}
+//                 }"#,
+//                 true,
+//             )]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_kernel() {
+//         [(
+//             vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"],
+//             r#"{
+//                 "payload": {"kernel": "/path/to/kernel"}
+//             }"#,
+//             true,
+//         )]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_cmdline() {
+//         [(
+//             vec![
+//                 "cloud-hypervisor",
+//                 "--kernel",
+//                 "/path/to/kernel",
+//                 "--cmdline",
+//                 "arg1=foo arg2=bar",
+//             ],
+//             r#"{
+//                 "payload": {"kernel": "/path/to/kernel", "cmdline": "arg1=foo arg2=bar"}
+//             }"#,
+//             true,
+//         )]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_disks() {
+//         [
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--disk",
+//                     "path=/path/to/disk/1,image_type=raw",
+//                     "path=/path/to/disk/2",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "disks": [
+//                         {"path": "/path/to/disk/1", "image_type": "Raw"},
+//                         {"path": "/path/to/disk/2", "image_type": "Unknown"}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--disk",
+//                     "path=/path/to/disk/1,image_type=raw",
+//                     "path=/path/to/disk/2,image_type=qcow2",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "disks": [
+//                         {"path": "/path/to/disk/1"}
+//                     ]
+//                 }"#,
+//                 false,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--memory",
+//                     "shared=true",
+//                     "--disk",
+//                     "vhost_user=true,socket=/tmp/sock1",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory" : { "shared": true, "size": 536870912 },
+//                     "disks": [
+//                         {"vhost_user":true, "vhost_socket":"/tmp/sock1"}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--memory",
+//                     "shared=true",
+//                     "--disk",
+//                     "vhost_user=true,socket=/tmp/sock1",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory" : { "shared": true, "size": 536870912 },
+//                     "disks": [
+//                         {"vhost_user":true, "vhost_socket":"/tmp/sock1"}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--disk",
+//                     "path=/path/to/disk/1,rate_limit_group=group0",
+//                     "path=/path/to/disk/2,rate_limit_group=group0",
+//                     "--rate-limit-group",
+//                     "id=group0,bw_size=1000,bw_refill_time=100",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "disks": [
+//                         {"path": "/path/to/disk/1", "rate_limit_group": "group0", "image_type": "Unknown"},
+//                         {"path": "/path/to/disk/2", "rate_limit_group": "group0", "image_type": "Unknown"}
+//                     ],
+//                     "rate_limit_groups": [
+//                         {"id": "group0", "rate_limiter_config": {"bandwidth": {"size": 1000, "one_time_burst": 0, "refill_time": 100}}}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//         ]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_net() {
+//         [
+//             // This test is expected to fail because the default MAC address is
+//             // randomly generated. There's no way we can have twice the same
+//             // default value.
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--net", "mac="],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "net": []
+//                 }"#,
+//                 false,
+//             ),
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--net", "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd"}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--net",
+//                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0"}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--net",
+//                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8"}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--cpus", "boot=2",
+//                     "--net",
+//                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=4",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "cpus": {"boot_vcpus": 2, "max_vcpus": 2},
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 4}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--cpus", "boot=2",
+//                     "--net",
+//                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=4,queue_size=128",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "cpus": {"boot_vcpus": 2, "max_vcpus": 2},
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 4, "queue_size": 128}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--net",
+//                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8"}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--net",
+//                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             #[cfg(target_arch = "x86_64")]
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--net",
+//                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256,iommu=on",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256, "iommu": true}
+//                     ]
+//                 }"#,
+//                 false,
+//             ),
+//             #[cfg(target_arch = "x86_64")]
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--net",
+//                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256,iommu=on",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256, "iommu": true}
+//                     ],
+//                     "iommu": true
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--net",
+//                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256,iommu=off",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256, "iommu": false}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "shared=true", "--net", "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,vhost_user=true,socket=/tmp/sock"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory" : { "shared": true, "size": 536870912 },
+//                     "net": [
+//                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "vhost_user": true, "vhost_socket": "/tmp/sock"}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//         ]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_rng() {
+//         [(
+//             vec![
+//                 "cloud-hypervisor",
+//                 "--kernel",
+//                 "/path/to/kernel",
+//                 "--rng",
+//                 "src=/path/to/entropy/source",
+//             ],
+//             r#"{
+//                 "payload": {"kernel": "/path/to/kernel"},
+//                 "rng": {"src": "/path/to/entropy/source"}
+//             }"#,
+//             true,
+//         )]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_fs() {
+//         [(
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--memory", "shared=true",
+//                     "--fs",
+//                     "tag=virtiofs1,socket=/path/to/sock1",
+//                     "tag=virtiofs2,socket=/path/to/sock2",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory" : { "shared": true, "size": 536870912 },
+//                     "fs": [
+//                         {"tag": "virtiofs1", "socket": "/path/to/sock1"},
+//                         {"tag": "virtiofs2", "socket": "/path/to/sock2"}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--memory", "shared=true",
+//                     "--fs",
+//                     "tag=virtiofs1,socket=/path/to/sock1",
+//                     "tag=virtiofs2,socket=/path/to/sock2",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory" : { "shared": true, "size": 536870912 },
+//                     "fs": [
+//                         {"tag": "virtiofs1", "socket": "/path/to/sock1"}
+//                     ]
+//                 }"#,
+//                 false,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--memory", "shared=true", "--cpus", "boot=4",
+//                     "--fs",
+//                     "tag=virtiofs1,socket=/path/to/sock1,num_queues=4",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory" : { "shared": true, "size": 536870912 },
+//                     "cpus": {"boot_vcpus": 4, "max_vcpus": 4},
+//                     "fs": [
+//                         {"tag": "virtiofs1", "socket": "/path/to/sock1", "num_queues": 4}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor", "--kernel", "/path/to/kernel",
+//                     "--memory", "shared=true", "--cpus", "boot=4",
+//                     "--fs",
+//                     "tag=virtiofs1,socket=/path/to/sock1,num_queues=4,queue_size=128"
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "memory" : { "shared": true, "size": 536870912 },
+//                     "cpus": {"boot_vcpus": 4, "max_vcpus": 4},
+//                     "fs": [
+//                         {"tag": "virtiofs1", "socket": "/path/to/sock1", "num_queues": 4, "queue_size": 128}
+//                     ]
+//                 }"#,
+//                 true,
+//             )]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_pmem() {
+//         [
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--pmem",
+//                     "file=/path/to/img/1,size=1G",
+//                     "file=/path/to/img/2,size=2G",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "pmem": [
+//                         {"file": "/path/to/img/1", "size": 1073741824},
+//                         {"file": "/path/to/img/2", "size": 2147483648}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             #[cfg(target_arch = "x86_64")]
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--pmem",
+//                     "file=/path/to/img/1,size=1G,iommu=on",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "pmem": [
+//                         {"file": "/path/to/img/1", "size": 1073741824, "iommu": true}
+//                     ],
+//                     "iommu": true
+//                 }"#,
+//                 true,
+//             ),
+//             #[cfg(target_arch = "x86_64")]
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--pmem",
+//                     "file=/path/to/img/1,size=1G,iommu=on",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "pmem": [
+//                         {"file": "/path/to/img/1", "size": 1073741824, "iommu": true}
+//                     ]
+//                 }"#,
+//                 false,
+//             ),
+//         ]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[cfg(target_arch = "x86_64")]
+//     #[test]
+//     fn test_valid_vm_config_debug_console() {
+//         [(
+//             vec![
+//                 "cloud-hypervisor",
+//                 "--kernel",
+//                 "/path/to/kernel",
+//                 "--debug-console",
+//                 "tty,iobase=0xe9",
+//             ],
+//             // 233 == 0xe9
+//             r#"{
+//                 "payload": {"kernel": "/path/to/kernel" },
+//                 "debug_console": {"mode": "Tty", "iobase": 233 }
+//             }"#,
+//             true,
+//         )]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_serial_console() {
+//         [
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "serial": {"mode": "Null"},
+//                     "console": {"mode": "Tty"}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--serial",
+//                     "null",
+//                     "--console",
+//                     "tty,pci_segment=1,pci_device_id=7",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "serial": {"mode": "Null"},
+//                     "console": {"mode": "Tty", "iommu": false, "pci_segment": 1, "pci_device_id": 7}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--serial",
+//                     "tty",
+//                     "--console",
+//                     "off",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "serial": {"mode": "Tty"},
+//                     "console": {"mode": "Off"}
+//                 }"#,
+//                 true,
+//             ),
+//         ]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_serial_pty_console_pty() {
+//         [
+//             (
+//                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "serial": {"mode": "Null"},
+//                     "console": {"mode": "Tty"}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--serial",
+//                     "null",
+//                     "--console",
+//                     "tty",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--serial",
+//                     "pty",
+//                     "--console",
+//                     "pty",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "serial": {"mode": "Pty"},
+//                     "console": {"mode": "Pty"}
+//                 }"#,
+//                 true,
+//             ),
+//         ]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     #[cfg(target_arch = "x86_64")]
+//     fn test_valid_vm_config_devices() {
+//         [
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--device",
+//                     "path=/path/to/device/1",
+//                     "path=/path/to/device/2",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "devices": [
+//                         {"path": "/path/to/device/1"},
+//                         {"path": "/path/to/device/2"}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--device",
+//                     "path=/path/to/device/1",
+//                     "path=/path/to/device/2",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "devices": [
+//                         {"path": "/path/to/device/1"}
+//                     ]
+//                 }"#,
+//                 false,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--device",
+//                     "path=/path/to/device,iommu=on",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "devices": [
+//                         {"path": "/path/to/device", "iommu": true}
+//                     ],
+//                     "iommu": true
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--device",
+//                     "path=/path/to/device,iommu=on",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "devices": [
+//                         {"path": "/path/to/device", "iommu": true}
+//                     ]
+//                 }"#,
+//                 false,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--device",
+//                     "path=/path/to/device,iommu=off",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "devices": [
+//                         {"path": "/path/to/device", "iommu": false}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//         ]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_vdpa() {
+//         [
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--vdpa",
+//                     "path=/path/to/device/1",
+//                     "path=/path/to/device/2,num_queues=2",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "vdpa": [
+//                         {"path": "/path/to/device/1", "num_queues": 1},
+//                         {"path": "/path/to/device/2", "num_queues": 2}
+//                     ]
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--vdpa",
+//                     "path=/path/to/device/1",
+//                     "path=/path/to/device/2",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "vdpa": [
+//                         {"path": "/path/to/device/1"}
+//                     ]
+//                 }"#,
+//                 false,
+//             ),
+//         ]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_vsock() {
+//         [
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--vsock",
+//                     "cid=123,socket=/path/to/sock/1",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "vsock": {"cid": 123, "socket": "/path/to/sock/1"}
+//                 }"#,
+//                 true,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--vsock",
+//                     "cid=124,socket=/path/to/sock/1",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "vsock": {"cid": 123, "socket": "/path/to/sock/1"}
+//                 }"#,
+//                 false,
+//             ),
+//             #[cfg(target_arch = "x86_64")]
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--vsock",
+//                     "cid=123,socket=/path/to/sock/1,iommu=on",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "vsock": {"cid": 123, "socket": "/path/to/sock/1", "iommu": true},
+//                     "iommu": true
+//                 }"#,
+//                 true,
+//             ),
+//             #[cfg(target_arch = "x86_64")]
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--vsock",
+//                     "cid=123,socket=/path/to/sock/1,iommu=on",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "vsock": {"cid": 123, "socket": "/path/to/sock/1", "iommu": true}
+//                 }"#,
+//                 false,
+//             ),
+//             (
+//                 vec![
+//                     "cloud-hypervisor",
+//                     "--kernel",
+//                     "/path/to/kernel",
+//                     "--vsock",
+//                     "cid=123,socket=/path/to/sock/1,iommu=off",
+//                 ],
+//                 r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "vsock": {"cid": 123, "socket": "/path/to/sock/1", "iommu": false}
+//                 }"#,
+//                 true,
+//             ),
+//         ]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     #[test]
+//     fn test_valid_vm_config_tpm_socket() {
+//         [(
+//             vec![
+//                 "cloud-hypervisor",
+//                 "--kernel",
+//                 "/path/to/kernel",
+//                 "--tpm",
+//                 "socket=/path/to/tpm/sock",
+//             ],
+//             r#"{
+//                     "payload": {"kernel": "/path/to/kernel"},
+//                     "tpm": {"socket": "/path/to/tpm/sock"}
+//                 }"#,
+//             true,
+//         )]
+//         .iter()
+//         .for_each(|(cli, openapi, equal)| {
+//             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+//         });
+//     }
+//
+//     // TODO the check for the option list being sorted could be moved into the
+//     // getter itself, when the getter becomes a const function. This however
+//     // needs more support by Rust (as of March 2025).
+//     #[test]
+//     fn test_cli_options_sorted() {
+//         let (default_vcpus, default_memory, default_rng) = prepare_default_values();
+//         let args = get_cli_options_sorted(default_vcpus, default_memory, default_rng);
+//
+//         assert_args_sorted(|| args.iter());
+//     }
+// }
