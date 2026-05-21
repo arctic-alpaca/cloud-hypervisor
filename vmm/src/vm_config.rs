@@ -4,6 +4,7 @@
 //
 use std::fmt::Debug;
 use std::net::IpAddr;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "fw_cfg")]
 use std::str::FromStr;
@@ -18,7 +19,7 @@ use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
 
 use crate::Landlock;
-use crate::de_ser::{Active, Fd, FdMarker, Serialized, StatusMarker};
+use crate::de_ser::{Activatable, Active, Fd, FdMarker, Serialized, StatusMarker};
 use crate::landlock::LandlockError;
 
 pub type LandlockResult<T> = result::Result<T, LandlockError>;
@@ -388,6 +389,14 @@ where
     pub offload_ufo: bool,
     #[serde(default = "default_netconfig_true")]
     pub offload_csum: bool,
+}
+
+impl Activatable for NetConfig<Serialized> {
+    type Activated = NetConfig<Active>;
+
+    fn activate(self, fds: Vec<OwnedFd>) -> Self::Activated {
+        todo!()
+    }
 }
 
 pub fn default_netconfig_true() -> bool {
@@ -1076,9 +1085,10 @@ where
     pub ivshmem: Option<IvshmemConfig>,
 }
 
-impl VmConfig<Serialized> {
-    pub fn validate(self) -> VmConfig<Active> {
-        //TODO(de_ser)
+impl Activatable for VmConfig<Serialized> {
+    type Activated = VmConfig<Active>;
+
+    fn activate(self, fds: Vec<OwnedFd>) -> Self::Activated {
         todo!()
     }
 }

@@ -53,210 +53,210 @@ use crate::api::{
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
-use crate::de_ser::Serialized;
+use crate::de_ser::{Activatable, Serialized};
 use crate::vm::Error as VmError;
 
-/// Helper module for attaching externally opened FDs to config objects.
-///
-/// # Difference between [`ConfigWithFDs`] and [`ConfigWithVariableFDs`]
-///
-/// The base trait [`ConfigWithFDs`] type must be implemented by all config
-/// types that want to take ownership of externally provided FDs.
-///
-/// In the case of restore operations, e.g., after a live-migration, config
-/// objects will know the amount of FDs they need. In this case, they must
-/// also implement [`ConfigWithVariableFDs`]. In other scenarios, such as
-/// hot device attach, the base type is sufficient and the type will take
-/// over all available FDs.
-///
-/// In any case, the management software (e.g., libvirt) is responsible for
-/// providing the exact amount of FDs.
-mod fds_helper {
-    use std::fs::File;
-    use std::os::fd::{IntoRawFd, RawFd};
-
-    use log::{debug, error, warn};
-
-    use crate::api::http::HttpError;
-
-    /// Abstraction over configuration types received via the HTTP API that
-    /// have associated externally opened FDs.
-    pub trait ConfigWithFDs {
-        /// Returns the ID of the device.
-        ///
-        /// Used for logging.
-        fn id(&self) -> Option<&str>;
-
-        /// Returns any FDs provided in the HTTP body.
-        ///
-        /// They will always be invalid and are used for user-facing logging.
-        fn fds_from_http_body(&self) -> Option<&[RawFd]>;
-
-        /// Assigns the provided file descriptors (`fds`) to this configuration
-        /// object.
-        ///
-        /// After calling this method, the configuration will behave as if it
-        /// had originally been created with these FDs. Next, the configuration
-        /// can be used to properly configure the corresponding device.
-        ///
-        /// # Arguments
-        /// - `fds`: Either a non-empty Vector with corresponding FDs or `None`
-        ///   indicating that no valid FDs were supplied.
-        fn set_fds(&mut self, fds: Option<Vec<RawFd>>);
-    }
-
-    /// Extension of [`ConfigWithFDs`] for config objects that know how many
-    /// FDs they want (e.g., a restore configuration that is aware of the
-    /// previous state).
-    pub trait ConfigWithVariableFDs: ConfigWithFDs {
-        /// Returns how many FDs this type wants to have from the pool of
-        /// available FDs.
-        fn expected_num_fds(&self) -> usize;
-    }
-
-    mod config_with_fds_impls {
-        use std::os::fd::RawFd;
-
-        use super::{ConfigWithFDs, ConfigWithVariableFDs};
-        use crate::config::RestoredNetConfig;
-        use crate::vm_config::NetConfig;
-
-        impl ConfigWithFDs for NetConfig {
-            fn id(&self) -> Option<&str> {
-                self.pci_common.id.as_deref()
-            }
-
-            fn fds_from_http_body(&self) -> Option<&[RawFd]> {
-                self.fds.as_deref()
-            }
-
-            fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
-                self.fds = fds;
-            }
-        }
-
-        impl ConfigWithFDs for RestoredNetConfig {
-            fn id(&self) -> Option<&str> {
-                Some(self.id.as_str())
-            }
-
-            fn fds_from_http_body(&self) -> Option<&[RawFd]> {
-                self.fds.as_deref()
-            }
-
-            fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
-                self.fds = fds;
-            }
-        }
-
-        impl ConfigWithVariableFDs for RestoredNetConfig {
-            fn expected_num_fds(&self) -> usize {
-                self.num_fds
-            }
-        }
-    }
-
-    fn attach_fds_to_cfg_inner<T: ConfigWithFDs>(
-        fds: &mut Vec<RawFd>,
-        fds_amount: usize,
-        cfg: &mut T,
-    ) {
-        if cfg.fds_from_http_body().is_some() {
-            // Only FDs transmitted via an SCM_RIGHTS UNIX Domain Socket message
-            // are valid. Any provided over the HTTP API are set to `-1` in our
-            // specialized serializer callbacks.
-            warn!(
-                "FD numbers were present in HTTP request body for device {:?} but will be ignored",
-                cfg.id()
-            );
-
-            // Reset old value in any case; if there are FDs, they are invalid.
-            cfg.set_fds(None);
-        }
-
-        if fds_amount > 0 {
-            let new_fds = fds.drain(..fds_amount).collect::<Vec<_>>();
-            debug!(
-                "Attaching network FDs received via UNIX domain socket to device: id={:?}, fds={new_fds:?}",
-                cfg.id()
-            );
-            cfg.set_fds(Some(new_fds));
-        }
-    }
-
-    /// Applies FDs to configs for their corresponding devices, as part of the special
-    /// handling for devices backed by externally provided FDs.
-    ///
-    /// The FDs (via `files`) must be provided in the exact order matching the
-    /// config struct they belong to.
-    ///
-    /// See [module description] for more info.
-    ///
-    /// # Arguments
-    /// - `device_fds`: Ordered list of all FDs from the request.
-    /// - `cfgs`: List of network configurations where each network can have up to `n` FDs.
-    ///
-    /// [module description]: self
-    pub fn attach_fds_to_cfgs<T: ConfigWithVariableFDs>(
-        device_fds: Vec<File>,
-        cfgs: &mut [&mut T],
-    ) -> Result<(), HttpError> {
-        let expected_fds: usize = cfgs.iter().map(|cfg| cfg.expected_num_fds()).sum();
-
-        if device_fds.len() != expected_fds {
-            error!(
-                "Number of expected FDs: {}, received: {}",
-                expected_fds,
-                device_fds.len()
-            );
-            return Err(HttpError::BadRequest);
-        }
-
-        // We are only interested in the raw FDs. After this operation, we are
-        // responsible for manually closing the FDs eventually.
-        let mut fds = device_fds
-            .into_iter()
-            .map(|f| f.into_raw_fd())
-            .collect::<Vec<_>>();
-
-        // For each config: We drain the FDs vector by the amount of FDs the config expects.
-        for cfg in cfgs {
-            attach_fds_to_cfg_inner(&mut fds, cfg.expected_num_fds(), *cfg);
-        }
-
-        // We checked that `fds.len() == expected_fds`; so if we panic here, we
-        // have a hard programming error
-        assert!(fds.is_empty());
-
-        Ok(())
-    }
-
-    /// Applies FDs to the config for the corresponding device, as part of the special
-    /// handling for devices backed by externally provided FDs.
-    ///
-    /// See [module description] for more info.
-    ///
-    /// # Arguments
-    /// - `device_fds`: Ordered list of all FDs from the request.
-    /// - `cfg`: The config object that wants to take ownership of all available FDs.
-    ///
-    /// [module description]: self
-    pub fn attach_fds_to_cfg<T: ConfigWithFDs>(
-        device_fds: Vec<File>,
-        cfg: &mut T,
-    ) -> Result<(), HttpError> {
-        // We are only interested in the raw FDs.
-        let mut fds = device_fds
-            .into_iter()
-            .map(|f| f.into_raw_fd())
-            .collect::<Vec<_>>();
-
-        let len = fds.len();
-        attach_fds_to_cfg_inner(&mut fds, len, cfg);
-
-        Ok(())
-    }
-}
+// /// Helper module for attaching externally opened FDs to config objects.
+// ///
+// /// # Difference between [`ConfigWithFDs`] and [`ConfigWithVariableFDs`]
+// ///
+// /// The base trait [`ConfigWithFDs`] type must be implemented by all config
+// /// types that want to take ownership of externally provided FDs.
+// ///
+// /// In the case of restore operations, e.g., after a live-migration, config
+// /// objects will know the amount of FDs they need. In this case, they must
+// /// also implement [`ConfigWithVariableFDs`]. In other scenarios, such as
+// /// hot device attach, the base type is sufficient and the type will take
+// /// over all available FDs.
+// ///
+// /// In any case, the management software (e.g., libvirt) is responsible for
+// /// providing the exact amount of FDs.
+// mod fds_helper {
+//     use std::fs::File;
+//     use std::os::fd::{IntoRawFd, RawFd};
+//
+//     use log::{debug, error, warn};
+//
+//     use crate::api::http::HttpError;
+//
+//     /// Abstraction over configuration types received via the HTTP API that
+//     /// have associated externally opened FDs.
+//     pub trait ConfigWithFDs {
+//         /// Returns the ID of the device.
+//         ///
+//         /// Used for logging.
+//         fn id(&self) -> Option<&str>;
+//
+//         /// Returns any FDs provided in the HTTP body.
+//         ///
+//         /// They will always be invalid and are used for user-facing logging.
+//         fn fds_from_http_body(&self) -> Option<&[RawFd]>;
+//
+//         /// Assigns the provided file descriptors (`fds`) to this configuration
+//         /// object.
+//         ///
+//         /// After calling this method, the configuration will behave as if it
+//         /// had originally been created with these FDs. Next, the configuration
+//         /// can be used to properly configure the corresponding device.
+//         ///
+//         /// # Arguments
+//         /// - `fds`: Either a non-empty Vector with corresponding FDs or `None`
+//         ///   indicating that no valid FDs were supplied.
+//         fn set_fds(&mut self, fds: Option<Vec<RawFd>>);
+//     }
+//
+//     /// Extension of [`ConfigWithFDs`] for config objects that know how many
+//     /// FDs they want (e.g., a restore configuration that is aware of the
+//     /// previous state).
+//     pub trait ConfigWithVariableFDs: ConfigWithFDs {
+//         /// Returns how many FDs this type wants to have from the pool of
+//         /// available FDs.
+//         fn expected_num_fds(&self) -> usize;
+//     }
+//
+//     mod config_with_fds_impls {
+//         use std::os::fd::RawFd;
+//
+//         use super::{ConfigWithFDs, ConfigWithVariableFDs};
+//         use crate::config::RestoredNetConfig;
+//         use crate::vm_config::NetConfig;
+//
+//         impl ConfigWithFDs for NetConfig {
+//             fn id(&self) -> Option<&str> {
+//                 self.pci_common.id.as_deref()
+//             }
+//
+//             fn fds_from_http_body(&self) -> Option<&[RawFd]> {
+//                 self.fds.as_deref()
+//             }
+//
+//             fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
+//                 self.fds = fds;
+//             }
+//         }
+//
+//         impl ConfigWithFDs for RestoredNetConfig {
+//             fn id(&self) -> Option<&str> {
+//                 Some(self.id.as_str())
+//             }
+//
+//             fn fds_from_http_body(&self) -> Option<&[RawFd]> {
+//                 self.fds.as_deref()
+//             }
+//
+//             fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
+//                 self.fds = fds;
+//             }
+//         }
+//
+//         impl ConfigWithVariableFDs for RestoredNetConfig {
+//             fn expected_num_fds(&self) -> usize {
+//                 self.num_fds
+//             }
+//         }
+//     }
+//
+//     fn attach_fds_to_cfg_inner<T: ConfigWithFDs>(
+//         fds: &mut Vec<RawFd>,
+//         fds_amount: usize,
+//         cfg: &mut T,
+//     ) {
+//         if cfg.fds_from_http_body().is_some() {
+//             // Only FDs transmitted via an SCM_RIGHTS UNIX Domain Socket message
+//             // are valid. Any provided over the HTTP API are set to `-1` in our
+//             // specialized serializer callbacks.
+//             warn!(
+//                 "FD numbers were present in HTTP request body for device {:?} but will be ignored",
+//                 cfg.id()
+//             );
+//
+//             // Reset old value in any case; if there are FDs, they are invalid.
+//             cfg.set_fds(None);
+//         }
+//
+//         if fds_amount > 0 {
+//             let new_fds = fds.drain(..fds_amount).collect::<Vec<_>>();
+//             debug!(
+//                 "Attaching network FDs received via UNIX domain socket to device: id={:?}, fds={new_fds:?}",
+//                 cfg.id()
+//             );
+//             cfg.set_fds(Some(new_fds));
+//         }
+//     }
+//
+//     /// Applies FDs to configs for their corresponding devices, as part of the special
+//     /// handling for devices backed by externally provided FDs.
+//     ///
+//     /// The FDs (via `files`) must be provided in the exact order matching the
+//     /// config struct they belong to.
+//     ///
+//     /// See [module description] for more info.
+//     ///
+//     /// # Arguments
+//     /// - `device_fds`: Ordered list of all FDs from the request.
+//     /// - `cfgs`: List of network configurations where each network can have up to `n` FDs.
+//     ///
+//     /// [module description]: self
+//     pub fn attach_fds_to_cfgs<T: ConfigWithVariableFDs>(
+//         device_fds: Vec<File>,
+//         cfgs: &mut [&mut T],
+//     ) -> Result<(), HttpError> {
+//         let expected_fds: usize = cfgs.iter().map(|cfg| cfg.expected_num_fds()).sum();
+//
+//         if device_fds.len() != expected_fds {
+//             error!(
+//                 "Number of expected FDs: {}, received: {}",
+//                 expected_fds,
+//                 device_fds.len()
+//             );
+//             return Err(HttpError::BadRequest);
+//         }
+//
+//         // We are only interested in the raw FDs. After this operation, we are
+//         // responsible for manually closing the FDs eventually.
+//         let mut fds = device_fds
+//             .into_iter()
+//             .map(|f| f.into_raw_fd())
+//             .collect::<Vec<_>>();
+//
+//         // For each config: We drain the FDs vector by the amount of FDs the config expects.
+//         for cfg in cfgs {
+//             attach_fds_to_cfg_inner(&mut fds, cfg.expected_num_fds(), *cfg);
+//         }
+//
+//         // We checked that `fds.len() == expected_fds`; so if we panic here, we
+//         // have a hard programming error
+//         assert!(fds.is_empty());
+//
+//         Ok(())
+//     }
+//
+//     /// Applies FDs to the config for the corresponding device, as part of the special
+//     /// handling for devices backed by externally provided FDs.
+//     ///
+//     /// See [module description] for more info.
+//     ///
+//     /// # Arguments
+//     /// - `device_fds`: Ordered list of all FDs from the request.
+//     /// - `cfg`: The config object that wants to take ownership of all available FDs.
+//     ///
+//     /// [module description]: self
+//     pub fn attach_fds_to_cfg<T: ConfigWithFDs>(
+//         device_fds: Vec<File>,
+//         cfg: &mut T,
+//     ) -> Result<(), HttpError> {
+//         // We are only interested in the raw FDs.
+//         let mut fds = device_fds
+//             .into_iter()
+//             .map(|f| f.into_raw_fd())
+//             .collect::<Vec<_>>();
+//
+//         let len = fds.len();
+//         attach_fds_to_cfg_inner(&mut fds, len, cfg);
+//
+//         Ok(())
+//     }
+// }
 
 // /api/v1/vm.create handler
 pub struct VmCreate {}
@@ -281,23 +281,24 @@ impl EndpointHandler for VmCreate {
                                 Err(e) => return error_response(e, StatusCode::BadRequest),
                             };
 
-                        if let Some(ref mut nets) = vm_config.net {
-                            let mut cfgs = nets.iter_mut().collect::<Vec<&mut _>>();
-                            let cfgs = cfgs.as_mut_slice();
+                        // if let Some(ref mut nets) = vm_config.net {
+                        //     let mut cfgs = nets.iter_mut().collect::<Vec<&mut _>>();
+                        //     let cfgs = cfgs.as_mut_slice();
+                        //
+                        //     // For the VmCreate call, we do not accept FDs from the socket currently.
+                        //     // This call sets all FDs to null while doing the same logging as
+                        //     // similar code paths.
+                        //     for cfg in cfgs {
+                        //         if let Err(e) = attach_fds_to_cfg(vec![], *cfg)
+                        //             .map_err(|e| error_response(e, StatusCode::InternalServerError))
+                        //         {
+                        //             return e;
+                        //         }
+                        //     }
+                        // }
 
-                            // For the VmCreate call, we do not accept FDs from the socket currently.
-                            // This call sets all FDs to null while doing the same logging as
-                            // similar code paths.
-                            for cfg in cfgs {
-                                if let Err(e) = attach_fds_to_cfg(vec![], *cfg)
-                                    .map_err(|e| error_response(e, StatusCode::InternalServerError))
-                                {
-                                    return e;
-                                }
-                            }
-                        }
-
-                        let vm_config = Box::new(vm_config.validate());
+                        // TODO(de_ser): error handling
+                        let vm_config = Box::new(vm_config.activate(vec![]).unwrap());
 
                         match crate::api::VmCreate
                             .send(api_notifier, api_sender, vm_config)
@@ -450,8 +451,12 @@ impl PutHandler for VmAddNet {
         files: Vec<File>,
     ) -> std::result::Result<Option<Body>, HttpError> {
         if let Some(body) = body {
-            let mut net_cfg: NetConfig = serde_json::from_slice(body.raw())?;
-            attach_fds_to_cfg(files, &mut net_cfg)?;
+            let mut net_cfg: NetConfig<Serialized> = serde_json::from_slice(body.raw())?;
+            // attach_fds_to_cfg(files, &mut net_cfg)?;
+            // TODO(de_ser): error handling
+            let net_cfg = net_cfg
+                .activate(files.into_iter().map(|file| file.into()).collect())
+                .unwrap();
 
             self.send(api_notifier, api_sender, net_cfg)
                 .map_err(HttpError::ApiError)
