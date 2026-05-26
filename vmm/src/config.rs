@@ -2917,51 +2917,9 @@ impl RestoreConfig<Active> {
         result
     }
 
-    // Ensure all net devices from 'VmConfig' backed by FDs have a
-    // corresponding 'RestoreNetConfig' with a matched 'id' and expected
-    // number of FDs.
     pub fn validate(&self, _vm_config: &VmConfig<Active>) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
-        }
-
-        let mut restored_net_with_fds = HashMap::new();
-        for n in self.net_fds.iter().flatten() {
-            assert_eq!(
-                n.num_fds,
-                n.fds.as_ref().map_or(0, |f| f.len()),
-                "Invalid 'RestoredNetConfig' with conflicted fields."
-            );
-            if restored_net_with_fds.insert(n.id.clone(), n).is_some() {
-                return Err(ValidationError::IdentifierNotUnique(n.id.clone()));
-            }
-        }
-
-        // for net_fds in vm_config.net.iter().flatten() {
-        //     if let Some(expected_fds) = &net_fds.fds {
-        //         let expected_id = net_fds
-        //             .pci_common
-        //             .id
-        //             .as_ref()
-        //             .expect("Invalid 'NetConfig' with empty 'id' for VM restore.");
-        //         if let Some(r) = restored_net_with_fds.remove(expected_id) {
-        //             if r.num_fds != expected_fds.len() {
-        //                 return Err(ValidationError::RestoreNetFdCountMismatch(
-        //                     expected_id.clone(),
-        //                     r.num_fds,
-        //                     expected_fds.len(),
-        //                 ));
-        //             }
-        //         } else {
-        //             return Err(ValidationError::RestoreMissingRequiredNetId(
-        //                 expected_id.clone(),
-        //             ));
-        //         }
-        //     }
-        // }
-
-        if !restored_net_with_fds.is_empty() {
-            warn!("Ignoring unused 'net_fds' for VM restore.");
         }
 
         Ok(())
@@ -4926,28 +4884,51 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             }
         );
         assert_eq!(
-            RestoreConfig::parse(
-                "source_url=/path/to/snapshot,prefault=off,net_fds=[net0@[3,4],net1@[5,6,7,8]]"
-            )?,
+            RestoreConfig::parse("source_url=/path/to/snapshot,prefault=off")?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: Some(vec![
-                    RestoredNetConfig {
-                        id: "net0".to_string(),
-                        num_fds: 2,
-                        fds: Some(vec![3, 4]),
-                    },
-                    RestoredNetConfig {
-                        id: "net1".to_string(),
-                        num_fds: 4,
-                        fds: Some(vec![5, 6, 7, 8]),
-                    }
-                ]),
+                net_fds: None,
                 resume: false,
             }
         );
+
+        {
+            let fd: OwnedFd = File::open("/dev/null").unwrap().into();
+            let fd_1 = fd.try_clone().unwrap().into_raw_fd();
+            let fd_2 = fd.try_clone().unwrap().into_raw_fd();
+            let fd_3 = fd.try_clone().unwrap().into_raw_fd();
+
+            let restore_config = RestoreConfig::parse(&format!(
+                "source_url=/path/to/snapshot,prefault=off,net_fds=[net0@[{fd_1},{fd_2}],net1@[{fd_3}]]"
+            ))?;
+            assert_eq!(
+                restore_config.net_fds.as_ref().unwrap()[0]
+                    .fds
+                    .as_ref()
+                    .unwrap()[0]
+                    .as_raw_fd(),
+                fd_1
+            );
+            assert_eq!(
+                restore_config.net_fds.as_ref().unwrap()[0]
+                    .fds
+                    .as_ref()
+                    .unwrap()[1]
+                    .as_raw_fd(),
+                fd_2
+            );
+            assert_eq!(
+                restore_config.net_fds.as_ref().unwrap()[1]
+                    .fds
+                    .as_ref()
+                    .unwrap()[0]
+                    .as_raw_fd(),
+                fd_3
+            );
+        }
+
         assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")?,
             RestoreConfig {
@@ -4997,7 +4978,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
     #[test]
     fn test_restore_config_validation() {
         // interested in only VmConfig.net, so set rest to default values
-        let mut snapshot_vm_config = VmConfig::<Serialized> {
+        let mut snapshot_vm_config = VmConfig::<Active> {
             cpus: CpusConfig::default(),
             memory: MemoryConfig::default(),
             payload: None,
@@ -5035,12 +5016,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                         ..Default::default()
                     },
                     num_queues: 2,
-                    fds: Some(vec![
-                        Fd::<Serialized>::new(-1),
-                        Fd::<Serialized>::new(-1),
-                        Fd::<Serialized>::new(-1),
-                        Fd::<Serialized>::new(-1),
-                    ]),
+                    fds: None,
                     ..net_fixture()
                 },
                 NetConfig {
@@ -5049,7 +5025,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                         ..Default::default()
                     },
                     num_queues: 1,
-                    fds: Some(vec![Fd::<Serialized>::new(-1), Fd::<Serialized>::new(-1)]),
+                    fds: None,
                     ..net_fixture()
                 },
                 NetConfig {
@@ -5075,73 +5051,17 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 RestoredNetConfig {
                     id: "net0".to_string(),
                     num_fds: 4,
-                    fds: Some(vec![3, 4, 5, 6]),
+                    fds: None,
                 },
                 RestoredNetConfig {
                     id: "net1".to_string(),
                     num_fds: 2,
-                    fds: Some(vec![7, 8]),
+                    fds: None,
                 },
             ]),
             resume: false,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "netx".to_string(),
-            num_fds: 4,
-            fds: Some(vec![3, 4, 5, 6]),
-        }]);
-        assert_eq!(
-            invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingRequiredNetId(
-                "net0".to_string()
-            ))
-        );
-
-        invalid_config.net_fds = Some(vec![
-            RestoredNetConfig {
-                id: "net0".to_string(),
-                num_fds: 4,
-                fds: Some(vec![3, 4, 5, 6]),
-            },
-            RestoredNetConfig {
-                id: "net0".to_string(),
-                num_fds: 4,
-                fds: Some(vec![3, 4, 5, 6]),
-            },
-        ]);
-        assert_eq!(
-            invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::IdentifierNotUnique("net0".to_string()))
-        );
-
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "net0".to_string(),
-            num_fds: 4,
-            fds: Some(vec![3, 4, 5, 6]),
-        }]);
-        assert_eq!(
-            invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingRequiredNetId(
-                "net1".to_string()
-            ))
-        );
-
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "net0".to_string(),
-            num_fds: 2,
-            fds: Some(vec![3, 4]),
-        }]);
-        assert_eq!(
-            invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreNetFdCountMismatch(
-                "net0".to_string(),
-                2,
-                4
-            ))
-        );
 
         let another_valid_config = RestoreConfig {
             source_url: PathBuf::from("/path/to/snapshot"),
@@ -5512,16 +5432,6 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::VhostUserRateLimiterNotSupported)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.net = Some(vec![NetConfig {
-            fds: Some(vec![0]),
-            ..net_fixture()
-        }]);
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::VnetReservedFd(0))
         );
 
         let mut invalid_config = valid_config.clone();
