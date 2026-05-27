@@ -36,8 +36,7 @@ use linux_loader::loader::bootparam::{boot_params, setup_header};
 use linux_loader::loader::elf::start_info::{
     hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
 };
-use log::{debug, error, info, trace};
-use serde::{Deserialize, Serialize};
+use log::{debug, error, info};
 pub use smbios::{SmbiosChassisConfig, SmbiosConfig, SmbiosSystem};
 use thiserror::Error;
 use vm_memory::{
