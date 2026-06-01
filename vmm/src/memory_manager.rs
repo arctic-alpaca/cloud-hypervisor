@@ -1571,7 +1571,6 @@ impl MemoryManager {
                 .filter(|r| r.2 == RegionType::Ram)
                 .map(|r| (r.0, r.1))
                 .collect();
-
             let arch_mem_regions: Vec<ArchMemRegion> = arch_mem_regions
                 .iter()
                 .map(|(a, b, c)| ArchMemRegion {

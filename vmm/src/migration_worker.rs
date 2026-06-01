@@ -13,9 +13,9 @@
 //! [`MigrationWorkerSpawnError`].
 
 use std::fmt::{Debug, Formatter};
-#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 
@@ -26,7 +26,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::Vmm;
 use crate::api::VmSendMigrationData;
-use crate::vm::{Vm, VmState};
+use crate::vm::{PostponedLifecycleEvent, Vm, VmState};
 
 #[derive(thiserror::Error)]
 #[error("Migration worker could not be spawned: {spawn_error}")]
@@ -72,9 +72,12 @@ pub struct MigrationWorker {
     vm_receiver: Receiver<Vm>,
     check_migration_evt: EventFd,
     config: VmSendMigrationData,
+    /// Shared with the main VMM thread.
+    postponed_lifecycle_event: Arc<Mutex<Option<PostponedLifecycleEvent>>>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     initial_vm_state: VmState,
+    cancel_migration: Arc<AtomicBool>,
 }
 
 impl MigrationWorker {
@@ -90,6 +93,8 @@ impl MigrationWorker {
             self.hypervisor.as_ref(),
             &self.config,
             self.initial_vm_state,
+            self.postponed_lifecycle_event.as_ref(),
+            &self.cancel_migration,
         )
         .inspect(|_| event!("vm", "migration-finished"))
         .inspect_err(|_| event!("vm", "migration-failed"));
@@ -112,19 +117,24 @@ impl MigrationWorker {
         vm: Vm,
         check_migration_evt: EventFd,
         config: VmSendMigrationData,
+        postponed_lifecycle_event: Arc<Mutex<Option<PostponedLifecycleEvent>>>,
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))] hypervisor: Arc<
             dyn hypervisor::Hypervisor,
         >,
         initial_vm_state: VmState,
     ) -> Result<MigrationWorkerHandle, MigrationWorkerSpawnError> {
+        let cancel_migration = Arc::new(AtomicBool::new(false));
+
         let (vm_sender, vm_receiver) = std::sync::mpsc::sync_channel(0);
         let worker = MigrationWorker {
             vm_receiver,
             check_migration_evt,
             config,
+            postponed_lifecycle_event,
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             hypervisor,
             initial_vm_state,
+            cancel_migration: Arc::clone(&cancel_migration),
         };
 
         let inner_handle = match thread::Builder::new()

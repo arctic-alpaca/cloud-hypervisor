@@ -206,6 +206,9 @@ pub enum Error {
     #[error("VM is not running")]
     VmNotRunning,
 
+    #[error("VM is currently migrating and can't be modified")]
+    VmMigrating,
+
     #[error("Cannot clone EventFd")]
     EventFdClone(#[source] io::Error),
 
@@ -763,6 +766,7 @@ impl Vm {
             })
             .transpose()?
             .flatten();
+
 
         Ok(Vm {
             #[cfg(feature = "tdx")]
@@ -3211,7 +3215,7 @@ impl Vm {
                 })?;
 
             Response::read_from(socket)?.ok_or_error(MigratableError::MigrateSend(anyhow!(
-                "Error during memory fd migration"
+                "Error during memory fd migration (got bad response)"
             )))?;
         }
 
@@ -3449,9 +3453,6 @@ impl Vm {
             .post_migration_announce();
     }
 
-    pub fn device_manager(&self) -> &Arc<Mutex<DeviceManager>> {
-        &self.device_manager
-    }
 }
 
 impl Pausable for Vm {

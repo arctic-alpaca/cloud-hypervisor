@@ -41,7 +41,7 @@ use std::sync::mpsc::{RecvError, SendError, Sender, channel};
 use std::time::Duration;
 
 use block::mirror::{MirrorPhase, MirrorStatus};
-use log::info;
+use log::{info, trace};
 use micro_http::Body;
 use option_parser::{OptionParser, OptionParserError, Toggle};
 use serde::{Deserialize, Serialize};
@@ -58,8 +58,8 @@ use crate::device_tree::DeviceTree;
 use crate::migration_transport::MAX_MIGRATION_CONNECTIONS;
 use crate::vm::{Error as VmError, VmState};
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
-    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, MemoryZoneConfig, NetConfig,
+    PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 
 /// API errors are sent back from the VMM API server through the ApiResponse.
@@ -354,6 +354,9 @@ pub struct VmReceiveMigrationData {
     /// Map with new network FDs on the new host.
     #[serde(default)]
     pub net_fds: Vec<RestoredNetConfig>,
+    /// Optional memory zone reconfiguration data.
+    #[serde(default)]
+    pub zones: Vec<MemoryZoneConfig>,
 }
 
 #[derive(Debug, Error)]
@@ -415,6 +418,7 @@ impl VmReceiveMigrationData {
                 receiver_url: migration.to_owned(),
                 tls_dir: None,
                 net_fds: vec![],
+                zones: vec![],
             };
 
             data.validate()?;
@@ -442,6 +446,7 @@ impl VmReceiveMigrationData {
             receiver_url,
             tls_dir,
             net_fds: vec![],
+            zones: vec![],
         };
 
         data.validate()?;
@@ -2193,6 +2198,7 @@ mod unit_tests {
                 receiver_url: "tcp:192.168.1.1:8080".to_string(),
                 tls_dir: None,
                 net_fds: vec![],
+                zones: vec![],
             }
         );
 
@@ -2208,7 +2214,7 @@ mod unit_tests {
         let tls_dir = std::env::temp_dir();
         let data = VmReceiveMigrationData::parse(&format!(
             "receiver_url=tcp:192.168.1.1:8080,tls_dir={}",
-            tls_dir.display()
+            tls_dir.display(),
         ))
         .unwrap();
         assert_eq!(
@@ -2217,6 +2223,7 @@ mod unit_tests {
                 receiver_url: "tcp:192.168.1.1:8080".to_string(),
                 tls_dir: Some(tls_dir),
                 net_fds: vec![],
+                zones: vec![],
             }
         );
 

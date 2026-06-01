@@ -1664,6 +1664,21 @@ impl DeviceManager {
             self.ivshmem_device = self.add_ivshmem_device(ivshmem, snapshot)?;
         }
 
+        #[cfg(all(target_arch = "x86_64", feature = "fw_cfg"))]
+        {
+            // If we have a boot order but no fw_cfg device, we must create the latter.
+            let mut vm_config = self.config.lock().unwrap();
+            if !self.boot_order.is_empty()
+                && let Some(payload_config) = vm_config.payload.as_mut()
+                && payload_config.fw_cfg_config.is_none()
+            {
+                info!(
+                    "fw_cfg device added implicitly as a requirement to configure the boot order of disks."
+                );
+                vm_config.payload.as_mut().unwrap().fw_cfg_config = Some(FwCfgConfig::default());
+            }
+        }
+
         Ok(())
     }
 

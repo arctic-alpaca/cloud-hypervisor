@@ -509,6 +509,7 @@ dependencies = [
  "tpm",
  "tracer",
  "vm-memory",
+ "vm-migration",
  "vmm",
  "vmm-sys-util",
  "wait-timeout",

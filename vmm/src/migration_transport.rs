@@ -40,22 +40,19 @@ use crate::{GuestMemoryMmap, VmMigrationConfig};
 /// receiver side.
 pub(crate) const MAX_MIGRATION_CONNECTIONS: u32 = 128;
 
-const MIGRATION_ACCEPT_TIMEOUT_DURATION: Duration = Duration::from_secs(60);
-
+/// Interval at which the [`KeepAliveStream`] sends keep alive messages.
+/// This must remain shorter than the old sender's 10-second read timeout.
+// TODO(keepalive): remove this interval when gardenlinux-release-26-09-18 compatibility ends.
 const MIGRATION_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
-const RECEIVE_MIGRATION_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
-const SEND_MIGRATION_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn set_migration_socket_timeouts(socket: &TcpStream, timeout: Duration) -> anyhow::Result<()> {
-    socket
-        .set_read_timeout(Some(timeout))
-        .context("Error setting read timeout on TCP socket")?;
-    socket
-        .set_write_timeout(Some(timeout))
-        .context("Error setting write timeout on TCP socket")?;
-    Ok(())
-}
+/// The timeout of the migration-receiver.
+///
+/// We set this to a relatively high number to ease local development with
+/// `ch-remote`. For production, this has no negative impacts as the management
+/// software has full control over the Cloud Hypervisor process and will kill
+/// the process on terminated migration. The timeout is used as a fallback
+/// if the management software doesn't kill the process correctly.
+const MIGRATION_ACCEPT_TIMEOUT_DURATION: Duration = Duration::from_secs(60);
 
 /// Transport-agnostic listener used to receive connections.
 #[derive(Debug)]
@@ -82,13 +79,9 @@ impl ReceiveListener {
                     .context("Failed to accept TCP migration connection")
                     .map_err(MigratableError::MigrateReceive)?;
 
-                set_migration_socket_timeouts(&socket, RECEIVE_MIGRATION_SOCKET_TIMEOUT)
-                    .map_err(MigratableError::MigrateReceive)?;
-
                 set_tcp_keepalive_and_user_timeout(&socket)
                     .context("Failed to set socket options")
                     .map_err(MigratableError::MigrateReceive)?;
-
                 let socket = SocketStream::Tcp(socket);
                 // TODO(keepalive): remove this wrapper when gardenlinux-release-26-09-18 compatibility ends.
                 if main_connection {
@@ -114,13 +107,9 @@ impl ReceiveListener {
                     .context("Failed to accept TCP connection")
                     .map_err(MigratableError::MigrateReceive)?;
 
-                set_migration_socket_timeouts(&socket, RECEIVE_MIGRATION_SOCKET_TIMEOUT)
-                    .map_err(MigratableError::MigrateReceive)?;
-
                 set_tcp_keepalive_and_user_timeout(&socket)
                     .context("Failed to set socket options")
                     .map_err(MigratableError::MigrateReceive)?;
-
                 let socket = TlsStream::new_server(socket, config)
                     .map(Box::new)
                     .map(SocketStream::Tls)
@@ -529,6 +518,9 @@ impl ReceiveAdditionalConnections {
 
 impl Drop for ReceiveAdditionalConnections {
     fn drop(&mut self) {
+        if let Err(error) = self.terminate_fd.write(1) {
+            warn!("Failed to write to termination fd: {error}");
+        }
         if self.accept_thread.is_some() {
             warn!(
                 "ReceiveAdditionalConnections was not cleaned up! Either cleanup() was never called (programming error) or it failed before completing."
@@ -607,6 +599,7 @@ impl SendAdditionalConnections {
         connections: NonZeroU32,
         tls_dir: Option<&Path>,
         guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+        cancel_migration: &Arc<AtomicBool>,
     ) -> Result<Self, MigratableError> {
         let mut threads = Vec::new();
         let configured_connections = connections.get();
@@ -637,6 +630,7 @@ impl SendAdditionalConnections {
             let message_rx = message_rx.clone();
             let worker_error = worker_error.clone();
             let notify_tx = notify_tx.clone();
+            let cancel_migration = Arc::clone(cancel_migration);
 
             let thread = thread::Builder::new()
                 .name(format!("migrate-send-memory-{n}"))
@@ -647,6 +641,7 @@ impl SendAdditionalConnections {
                         &message_rx,
                         &worker_error,
                         &notify_tx,
+                        &cancel_migration,
                     )
                 })
                 .inspect_err(|_| {
@@ -678,6 +673,7 @@ impl SendAdditionalConnections {
         message_rx: &Mutex<Receiver<SendMemoryThreadMessage>>,
         worker_error: &AtomicBool,
         notify_tx: &Sender<SendMemoryThreadNotify>,
+        cancel_migration: &AtomicBool,
     ) -> Result<(), MigratableError> {
         info!("Spawned thread to send VM memory.");
         loop {
@@ -701,13 +697,22 @@ impl SendAdditionalConnections {
                 })?;
             match message {
                 SendMemoryThreadMessage::Memory(table) => {
-                    send_memory_ranges(guest_memory, &table, socket)
+                    if worker_error.load(Ordering::Acquire) {
+                        continue;
+                    }
+
+                    send_memory_ranges(guest_memory, &table, socket, cancel_migration)
                         .inspect_err(|_| {
                             worker_error.store(true, Ordering::Relaxed);
                             notify_tx.send(SendMemoryThreadNotify::Error).ok();
                         })
-                        .context("Error sending memory to receiver side")
-                        .map_err(MigratableError::MigrateSend)?;
+                        .map_err(|e| match e {
+                            MigratableError::Cancelled => MigratableError::Cancelled,
+                            e => MigratableError::MigrateSend(
+                                anyhow::Error::new(e)
+                                    .context("Error sending memory to receiver side"),
+                            ),
+                        })?;
                 }
                 SendMemoryThreadMessage::Gate(gate) => {
                     notify_tx
@@ -728,23 +733,27 @@ impl SendAdditionalConnections {
         }
     }
 
-    /// Send memory via all connections that we have. `socket` is the original socket
-    /// that was used to connect to the destination. Returns Ok(true) if memory was
-    /// sent, Ok(false) if the given table was empty.
+    /// Send memory via all connections and wait for it to be received.
     ///
-    /// When this function returns, all memory has been sent and acknowledged.
+    /// `socket` is the original socket that was used to connect to the
+    /// destination. Returns `Ok(true)` if memory was sent and `Ok(false)` if
+    /// the given table was empty.
     pub(crate) fn send_memory(
         &mut self,
         table: MemoryRangeTable,
         socket: &mut SocketStream,
+        cancel_migration: &AtomicBool,
     ) -> Result<bool, MigratableError> {
         if table.regions().is_empty() {
             return Ok(false);
         }
 
-        // If we use only one connection, we send the memory directly.
+        // Single connection: send memory directly and handle cancellation here.
+        // Multiple connections handle cancellation in SendAdditionalConnections.
         if self.threads.is_empty() {
-            send_memory_ranges(&self.guest_memory, &table, socket)?;
+            for chunk in table.partition(Self::CHUNK_SIZE) {
+                send_memory_ranges(&self.guest_memory, &chunk, socket, cancel_migration)?;
+            }
             return Ok(true);
         }
 
@@ -834,7 +843,7 @@ impl SendAdditionalConnections {
             // All threads may have terminated, leading to a dropped receiver. Thus we ignore
             // errors here.
             self.message_tx
-                .try_send(SendMemoryThreadMessage::Disconnect)
+                .send(SendMemoryThreadMessage::Disconnect)
                 .ok();
         }
 
@@ -946,8 +955,6 @@ pub(crate) fn send_migration_socket(
         let socket = TcpStream::connect(address).map_err(|e| {
             MigratableError::MigrateSend(anyhow!("Error connecting to TCP socket: {e}"))
         })?;
-        set_migration_socket_timeouts(&socket, SEND_MIGRATION_SOCKET_TIMEOUT)
-            .map_err(MigratableError::MigrateSend)?;
 
         set_tcp_keepalive_and_user_timeout(&socket)
             .context("Failed to set socket options")
@@ -1064,10 +1071,13 @@ pub(crate) fn send_state(
 /// Sends a memory migration request, the range table, and the corresponding
 /// guest memory range over the given socket. Waits for acknowledgment
 /// from the destination.
+///
+/// In case the migration is cancelled, this shortcuts the transfer.
 pub(crate) fn send_memory_ranges(
     guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
     ranges: &MemoryRangeTable,
     socket: &mut SocketStream,
+    cancel_migration: &AtomicBool,
 ) -> Result<(), MigratableError> {
     if ranges.regions().is_empty() {
         return Ok(());
@@ -1087,6 +1097,10 @@ pub(crate) fn send_memory_ranges(
         // following the correct behavior. For more info about this issue
         // see: https://github.com/rust-vmm/vm-memory/issues/174
         loop {
+            if cancel_migration.load(Ordering::Acquire) {
+                return Err(MigratableError::Cancelled);
+            }
+
             let bytes_written = mem
                 .write_volatile_to(
                     GuestAddress(range.gpa + offset),
@@ -1143,6 +1157,13 @@ pub(crate) fn receive_memory_ranges(
                         "Error receiving memory from socket: {e}"
                     ))
                 })?;
+
+            // EOF: Don't spin forever on closed connection
+            if bytes_read == 0 {
+                return Err(MigratableError::MigrateReceive(anyhow!(
+                    "Connection closed while receiving memory: EOF"
+                )));
+            }
             offset += bytes_read as u64;
 
             if offset == range.length {

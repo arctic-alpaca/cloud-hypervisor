@@ -876,7 +876,6 @@ impl VcpuState {
 
             thread::sleep(retry_interval);
         }
-        Ok(())
     }
 
     fn join_thread(&mut self) -> Result<()> {
