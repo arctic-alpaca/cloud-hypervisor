@@ -17,6 +17,7 @@ pub mod regs;
 pub mod tdx;
 
 mod helpers;
+mod hyperv_msrs;
 mod mpspec;
 mod mptable;
 mod smbios;
@@ -151,6 +152,13 @@ pub enum Error {
     /// Error checking CPUID compatibility
     #[error("Error checking CPUID compatibility")]
     CpuidCheckCompatibility,
+
+    /// Error when trying to apply a CPU profile because a necessary MSR was not found.
+    ///
+    /// We encourage functions returning this variant to log all missing MSRs for debugging
+    /// purposes.
+    #[error("The selected CPU profile cannot be utilized because a necessary MSR was not found")]
+    CpuProfileMissingMsr,
 
     // Error writing EBDA address
     #[error("Error writing EBDA address")]
