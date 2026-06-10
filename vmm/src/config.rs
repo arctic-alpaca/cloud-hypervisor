@@ -4332,9 +4332,7 @@ impl Clone for VmConfig {
                     fds.iter()
                         .map(|fd| {
                             // SAFETY: Trivially safe.
-                            let fd_duped = unsafe { libc::dup(*fd) };
-                            warn!("Cloning VM config: duping preserved FD {fd} => {fd_duped}");
-                            fd_duped
+                            unsafe { libc::dup(*fd) }
                         })
                         .collect()
                 }),
