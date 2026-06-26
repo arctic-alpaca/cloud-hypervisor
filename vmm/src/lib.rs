@@ -9,7 +9,7 @@ use std::io::{Read, Write, stdout};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvError, SendError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1791,6 +1791,11 @@ impl Vmm {
                 .update(MigrationStateOngoingPhase::Completing, None, None, None);
         }
 
+        // Final cancellation check before releasing disk locks
+        if cancel_migration.load(Ordering::Acquire) {
+            return Err(MigratableError::Cancelled);
+        }
+
         // We release the locks early to enable locking them on the destination host.
         // The VM is already stopped.
         vm.release_disk_locks()
@@ -2033,6 +2038,17 @@ impl Vmm {
                 if let Err(e) = self.exit_evt.write(1) {
                     error!("Failed exiting the VMM after migration: {e}");
                 }
+            }
+            Err(MigratableError::Cancelled) => {
+                warn!("Migration cancelled");
+                try_resume_vm_after_failed_migration(vm);
+
+                MIGRATION_PROGRESS_SNAPSHOT
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .expect("live migration should be ongoing")
+                    .mark_as_cancelled();
             }
             Err(e) => {
                 error!(
@@ -3236,6 +3252,25 @@ impl RequestHandler for Vmm {
         // enable querying the state of the last failed migration.
         let lock = MIGRATION_PROGRESS_SNAPSHOT.lock().unwrap();
         lock.clone()
+    }
+
+    /// Tries to cancel the currently active migration.
+    ///
+    /// Determining the outcome requires external observation.
+    fn vm_cancel_migration(&mut self) -> result::Result<(), MigratableError> {
+        let VmOwnership::Migration {
+            migration_worker_handle,
+            ..
+        } = &self.vm
+        else {
+            return Err(MigratableError::CancelMigration(anyhow!(
+                "There is no ongoing migration"
+            )));
+        };
+
+        migration_worker_handle.try_cancel_migration();
+
+        Ok(())
     }
 
     fn vm_disk_mirror_start(
