@@ -555,7 +555,8 @@ impl VmOps for VmOpsHandler {
     fn pio_write(&self, port: u64, data: &[u8]) -> result::Result<(), HypervisorVmError> {
         match self.io_bus.write(port, data) {
             Err(vm_device::BusError::MissingAddressRange) => {
-                info!("Guest PIO write to unregistered address 0x{port:x}");
+                // TODO: Make this `info!` again (see https://github.com/cobaltcore-dev/cobaltcore/issues/603)
+                debug!("Guest PIO write to unregistered address 0x{port:x}");
             }
             Ok(Some(barrier)) => {
                 info!("Waiting for barrier");
