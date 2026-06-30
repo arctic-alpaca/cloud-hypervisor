@@ -1001,6 +1001,7 @@ impl Block {
                     }
                 }
             }
+            LockGranularityChoice::QemuCompatible => LockGranularity::QemuCompatible,
         }
     }
 
