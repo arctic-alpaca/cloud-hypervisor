@@ -42,11 +42,18 @@ enum FcntlArg<'a> {
 
 /// Wrapper for [`libc::fcntl`] that properly sets the function arguments.
 fn fcntl(fd: RawFd, arg: FcntlArg) -> libc::c_int {
-    // SAFETY: We use a valid FD.
+    // SAFETY:
+    // - `F_OFD_SETLK` and `F_OFD_GETLK` fcntl calls handle invalid file descriptors.
+    // - `F_OFD_SETLK` does not modify `flock`.
+    // - `F_OFD_GETLK` uses a mutable pointer to `flock`.
     unsafe {
         match arg {
-            FcntlArg::F_OFD_SETLK(flock) => libc::fcntl(fd, libc::F_OFD_SETLK, flock),
-            FcntlArg::F_OFD_GETLK(flock) => libc::fcntl(fd, libc::F_OFD_GETLK, flock),
+            FcntlArg::F_OFD_SETLK(flock) => {
+                libc::fcntl(fd, libc::F_OFD_SETLK, flock as *const libc::flock)
+            }
+            FcntlArg::F_OFD_GETLK(flock) => {
+                libc::fcntl(fd, libc::F_OFD_GETLK, flock as *mut libc::flock)
+            }
         }
     }
 }
