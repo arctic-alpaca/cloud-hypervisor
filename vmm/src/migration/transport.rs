@@ -82,7 +82,9 @@ impl ReceiveListener {
                 set_tcp_keepalive_and_user_timeout(&socket)
                     .context("Failed to set socket options")
                     .map_err(MigratableError::MigrateReceive)?;
+
                 let socket = SocketStream::Tcp(socket);
+
                 // TODO(keepalive): remove this wrapper when gardenlinux-release-26-09-18 compatibility ends.
                 if main_connection {
                     KeepAliveStream::new(socket, MIGRATION_KEEP_ALIVE_INTERVAL)
@@ -110,6 +112,7 @@ impl ReceiveListener {
                 set_tcp_keepalive_and_user_timeout(&socket)
                     .context("Failed to set socket options")
                     .map_err(MigratableError::MigrateReceive)?;
+
                 let socket = TlsStream::new_server(socket, config)
                     .map(Box::new)
                     .map(SocketStream::Tls)

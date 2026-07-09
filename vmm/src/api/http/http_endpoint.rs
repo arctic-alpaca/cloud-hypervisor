@@ -46,16 +46,13 @@ use crate::api::VmCoredump;
 use crate::api::http::http_endpoint::fds_helper::{attach_fds_to_cfg, attach_fds_to_cfgs};
 use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
-    AddDisk, ApiAction, ApiError, ApiRequest,
-    NetConfig, VmAddDevice, VmAddFs, VmAddGenericVhostUser,
-    VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa,
-    VmAddVsock, VmBoot, VmCancelMigration, VmConfig,
-    VmCounters, VmDelete, VmDiskMirrorCancel, VmDiskMirrorComplete,
-    VmDiskMirrorStart, VmDiskMirrorStatus, VmMigrationProgress, VmNmi,
-    VmPause, VmPostMigrationAnnounce, VmPowerButton, VmReboot,
-    VmReceiveMigration, VmReceiveMigrationData, VmRemoveDevice, VmResize,
-    VmResizeDisk, VmResizeZone, VmRestore, VmResume,
-    VmSendMigration, VmShutdown, VmSnapshot,
+    AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs,
+    VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
+    VmCancelMigration, VmConfig, VmCounters, VmDelete, VmDiskMirrorCancel, VmDiskMirrorComplete,
+    VmDiskMirrorStart, VmDiskMirrorStatus, VmMigrationProgress, VmNmi, VmPause,
+    VmPostMigrationAnnounce, VmPowerButton, VmReboot, VmReceiveMigration, VmReceiveMigrationData,
+    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
+    VmShutdown, VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
