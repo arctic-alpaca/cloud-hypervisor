@@ -861,7 +861,7 @@ fn add_user_device_config(config: &str) -> Result<String, Error> {
 }
 
 fn remove_device_config(id: &str) -> String {
-    let remove_device_data = api::VmRemoveDeviceData { id: id.to_owned() };
+    let remove_device_data = api::types::VmRemoveDeviceData { id: id.to_owned() };
 
     serde_json::to_string(&remove_device_data).unwrap()
 }
