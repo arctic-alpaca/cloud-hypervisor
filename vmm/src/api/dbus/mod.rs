@@ -21,7 +21,7 @@ use super::{ApiAction, ApiRequest};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::api::VmCoredump;
 use crate::api::{
-    AddDisk, Body, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet, VmAddPmem,
+    self, AddDisk, Body, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet, VmAddPmem,
     VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmCreate, VmDelete, VmInfo,
     VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeZone,
     VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmmPing, VmmShutdown,
@@ -277,8 +277,11 @@ impl DBusApi {
     }
 
     async fn vm_restore(&self, restore_config: String) -> Result<()> {
-        let restore_config = serde_json::from_str(&restore_config).map_err(api_error)?;
-        self.vm_action(&VmRestore, restore_config).await.map(|_| ())
+        let restore_config: api::types::RestoreConfig =
+            serde_json::from_str(&restore_config).map_err(api_error)?;
+        self.vm_action(&VmRestore, restore_config.into())
+            .await
+            .map(|_| ())
     }
 
     async fn vm_receive_migration(&self, receive_migration_data: String) -> Result<()> {
