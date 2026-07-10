@@ -1,5 +1,7 @@
 mod vm_device;
 mod vm_resize;
+mod vm_snapshot;
 
 pub use vm_device::*;
 pub use vm_resize::*;
+pub use vm_snapshot::*;

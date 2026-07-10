@@ -923,7 +923,7 @@ fn add_vsock_config(config: &str) -> Result<String, Error> {
 }
 
 fn snapshot_config(url: &str) -> String {
-    let snapshot_config = api::VmSnapshotConfig {
+    let snapshot_config = api::types::VmSnapshotConfig {
         destination_url: String::from(url),
     };
 
