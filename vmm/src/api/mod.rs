@@ -54,7 +54,9 @@ use vmm_sys_util::eventfd::EventFd;
 pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
-use crate::api::types::{VmRemoveDeviceData, VmResizeData, VmResizeDiskData, VmResizeZoneData};
+use crate::api::types::{
+    VmRemoveDeviceData, VmResizeData, VmResizeDiskData, VmResizeZoneData, VmSnapshotConfig,
+};
 use crate::config::RestoreConfig;
 use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
@@ -235,12 +237,6 @@ pub struct VmmPingResponse {
     pub version: String,
     pub pid: i64,
     pub features: Vec<String>,
-}
-
-#[derive(Clone, Deserialize, Serialize, Default, Debug)]
-pub struct VmSnapshotConfig {
-    /// The snapshot destination URL
-    pub destination_url: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
