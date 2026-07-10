@@ -47,9 +47,10 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+use crate::api::types::VmmPingResponse;
 use crate::api::{
     ApiRequest, ApiResponse, MigrationMode, RequestHandler, TimeoutStrategy, VmInfoResponse,
-    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    VmReceiveMigrationData, VmSendMigrationData,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
