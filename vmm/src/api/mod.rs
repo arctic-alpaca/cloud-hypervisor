@@ -57,11 +57,10 @@ use crate::Error as VmmError;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::api::types::VmCoredumpData;
 use crate::api::types::{
-    VmRemoveDeviceData, VmResizeData, VmResizeDiskData, VmResizeZoneData,
+    DeviceTree, VmRemoveDeviceData, VmResizeData, VmResizeDiskData, VmResizeZoneData,
     VmSnapshotConfig, VmState, VmmPingResponse,
 };
 use crate::config::RestoreConfig;
-use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
 };
