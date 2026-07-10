@@ -57,8 +57,8 @@ use crate::Error as VmmError;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::api::types::VmCoredumpData;
 use crate::api::types::{
-    DeviceTree, VmRemoveDeviceData, VmResizeData, VmResizeDiskData, VmResizeZoneData,
-    VmSnapshotConfig, VmState, VmmPingResponse,
+    VmInfoResponse, VmRemoveDeviceData, VmResizeData, VmResizeDiskData, VmResizeZoneData,
+    VmSnapshotConfig, VmmPingResponse,
 };
 use crate::config::RestoreConfig;
 use crate::migration::transport::{
@@ -223,15 +223,6 @@ pub enum ApiError {
     VmNmi(#[source] VmError),
 }
 pub type ApiResult<T> = Result<T, ApiError>;
-
-#[serde_with::skip_serializing_none]
-#[derive(Clone, Deserialize, Serialize)]
-pub struct VmInfoResponse {
-    pub config: Box<VmConfig>,
-    pub state: VmState,
-    pub memory_actual_size: u64,
-    pub device_tree: Option<DeviceTree>,
-}
 
 /// Memory transfer mode for a migration.
 #[derive(Copy, Clone, Default, Deserialize, Serialize, Debug, PartialEq, Eq)]
