@@ -31,7 +31,6 @@ use log::{debug, error, info, warn};
 use memory_manager::MemoryManagerSnapshotData;
 use pci::PciBdf;
 use seccompiler::{BpfProgram, SeccompAction, apply_filter};
-use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
@@ -347,21 +346,6 @@ impl AsRawFd for EpollContext {
 pub struct PciDeviceInfo {
     pub id: String,
     pub bdf: PciBdf,
-}
-
-impl Serialize for PciDeviceInfo {
-    fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let bdf_str = self.bdf.to_string();
-
-        // Serialize the structure.
-        let mut state = serializer.serialize_struct("PciDeviceInfo", 2)?;
-        state.serialize_field("id", &self.id)?;
-        state.serialize_field("bdf", &bdf_str)?;
-        state.end()
-    }
 }
 
 pub fn feature_list() -> Vec<String> {
@@ -2666,7 +2650,7 @@ impl RequestHandler for Vmm {
                 let info = vm.add_device(device_cfg).inspect_err(|e| {
                     error!("Error when adding new device to the VM: {e:?}");
                 })?;
-                serde_json::to_vec(&info)
+                serde_json::to_vec::<api::types::PciDeviceInfo>(&info.into())
                     .map(Some)
                     .map_err(VmError::SerializeJson)
             }
@@ -2698,7 +2682,7 @@ impl RequestHandler for Vmm {
                 let info = vm.add_user_device(device_cfg).inspect_err(|e| {
                     error!("Error when adding new user device to the VM: {e:?}");
                 })?;
-                serde_json::to_vec(&info)
+                serde_json::to_vec::<api::types::PciDeviceInfo>(&info.into())
                     .map(Some)
                     .map_err(VmError::SerializeJson)
             }
@@ -2750,7 +2734,7 @@ impl RequestHandler for Vmm {
                 let info = vm.add_disk(disk_cfg).inspect_err(|e| {
                     error!("Error when adding new disk to the VM: {e:?}");
                 })?;
-                serde_json::to_vec(&info)
+                serde_json::to_vec::<api::types::PciDeviceInfo>(&info.into())
                     .map(Some)
                     .map_err(VmError::SerializeJson)
             }
@@ -2779,7 +2763,7 @@ impl RequestHandler for Vmm {
                 let info = vm.add_fs(fs_cfg).inspect_err(|e| {
                     error!("Error when adding new fs to the VM: {e:?}");
                 })?;
-                serde_json::to_vec(&info)
+                serde_json::to_vec::<api::types::PciDeviceInfo>(&info.into())
                     .map(Some)
                     .map_err(VmError::SerializeJson)
             }
@@ -2816,7 +2800,7 @@ impl RequestHandler for Vmm {
                     .inspect_err(|e| {
                         error!("Error when adding new generic vhost-user device to the VM: {e:?}");
                     })?;
-                serde_json::to_vec(&info)
+                serde_json::to_vec::<api::types::PciDeviceInfo>(&info.into())
                     .map(Some)
                     .map_err(VmError::SerializeJson)
             }
@@ -2845,7 +2829,7 @@ impl RequestHandler for Vmm {
                 let info = vm.add_pmem(pmem_cfg).inspect_err(|e| {
                     error!("Error when adding new pmem device to the VM: {e:?}");
                 })?;
-                serde_json::to_vec(&info)
+                serde_json::to_vec::<api::types::PciDeviceInfo>(&info.into())
                     .map(Some)
                     .map_err(VmError::SerializeJson)
             }
@@ -2874,7 +2858,7 @@ impl RequestHandler for Vmm {
                 let info = vm.add_net(net_cfg).inspect_err(|e| {
                     error!("Error when adding new network device to the VM: {e:?}");
                 })?;
-                serde_json::to_vec(&info)
+                serde_json::to_vec::<api::types::PciDeviceInfo>(&info.into())
                     .map(Some)
                     .map_err(VmError::SerializeJson)
             }
@@ -2903,7 +2887,7 @@ impl RequestHandler for Vmm {
                 let info = vm.add_vdpa(vdpa_cfg).inspect_err(|e| {
                     error!("Error when adding new vDPA device to the VM: {e:?}");
                 })?;
-                serde_json::to_vec(&info)
+                serde_json::to_vec::<api::types::PciDeviceInfo>(&info.into())
                     .map(Some)
                     .map_err(VmError::SerializeJson)
             }
@@ -2937,7 +2921,7 @@ impl RequestHandler for Vmm {
                 let info = vm.add_vsock(vsock_cfg).inspect_err(|e| {
                     error!("Error when adding new vsock device to the VM: {e:?}");
                 })?;
-                serde_json::to_vec(&info)
+                serde_json::to_vec::<api::types::PciDeviceInfo>(&info.into())
                     .map(Some)
                     .map_err(VmError::SerializeJson)
             }
