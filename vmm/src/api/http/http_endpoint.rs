@@ -559,7 +559,8 @@ impl PutHandler for VmRestore {
         files: Vec<File>,
     ) -> result::Result<Option<Body>, HttpError> {
         if let Some(body) = body {
-            let mut restore_cfg: RestoreConfig = serde_json::from_slice(body.raw())?;
+            let restore_cfg: api::types::RestoreConfig = serde_json::from_slice(body.raw())?;
+            let mut restore_cfg: RestoreConfig = restore_cfg.into();
 
             if let Some(cfgs) = restore_cfg.net_fds.as_mut() {
                 let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();

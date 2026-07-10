@@ -23,7 +23,7 @@ use log::error;
 use option_parser::{ByteSized, ByteSizedParseError};
 use thiserror::Error;
 use vmm::api;
-use vmm::config::{self, RestoreConfig};
+use vmm::config::{self};
 use vmm::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
     UserDeviceConfig, VdpaConfig, VsockConfig,
@@ -65,7 +65,7 @@ enum Error {
     #[error("Error parsing vsock syntax")]
     AddVsockConfig(#[source] config::Error),
     #[error("Error parsing restore syntax")]
-    Restore(#[source] config::Error),
+    Restore(#[source] api::types::ParseRestoreError),
     #[error("Error reading from stdin")]
     ReadingStdin(#[source] io::Error),
     #[error("Error reading from file")]
@@ -931,7 +931,7 @@ fn snapshot_config(url: &str) -> String {
 }
 
 fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
-    let mut restore_config = RestoreConfig::parse(config).map_err(Error::Restore)?;
+    let mut restore_config = api::types::RestoreConfig::parse(config).map_err(Error::Restore)?;
     // RestoreConfig is modified on purpose to take out the file descriptors.
     // These fds are passed to the server side process via SCM_RIGHTS
     let fds = match &mut restore_config.net_fds {
@@ -1131,7 +1131,7 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
                 Arg::new("restore_config")
                     .index(1)
                     .required(true)
-                    .help(RestoreConfig::SYNTAX),
+                    .help(api::types::RestoreConfig::SYNTAX),
             ),
         Command::new("resume").about("Resume the VM"),
         Command::new("send-migration")
