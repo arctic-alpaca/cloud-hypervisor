@@ -58,14 +58,14 @@ use crate::Error as VmmError;
 use crate::api::types::VmCoredumpData;
 use crate::api::types::{
     VmRemoveDeviceData, VmResizeData, VmResizeDiskData, VmResizeZoneData,
-    VmSnapshotConfig, VmmPingResponse,
+    VmSnapshotConfig, VmState, VmmPingResponse,
 };
 use crate::config::RestoreConfig;
 use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
 };
-use crate::vm::{Error as VmError, VmState};
+use crate::vm::Error as VmError;
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
     UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
@@ -232,14 +232,6 @@ pub struct VmInfoResponse {
     pub state: VmState,
     pub memory_actual_size: u64,
     pub device_tree: Option<DeviceTree>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct VmmPingResponse {
-    pub build_version: String,
-    pub version: String,
-    pub pid: i64,
-    pub features: Vec<String>,
 }
 
 /// Memory transfer mode for a migration.
