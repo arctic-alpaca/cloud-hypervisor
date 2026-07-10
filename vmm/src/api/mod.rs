@@ -54,6 +54,8 @@ use vmm_sys_util::eventfd::EventFd;
 pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use crate::api::types::VmCoredumpData;
 use crate::api::types::{
     VmRemoveDeviceData, VmResizeData, VmResizeDiskData, VmResizeZoneData, VmSnapshotConfig,
 };
@@ -62,7 +64,7 @@ use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
 };
-use crate::vm::{Error as VmError, VmState};
+use crate::vm::Error as VmError;
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
     UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
@@ -229,20 +231,6 @@ pub struct VmInfoResponse {
     pub state: VmState,
     pub memory_actual_size: u64,
     pub device_tree: Option<DeviceTree>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct VmmPingResponse {
-    pub build_version: String,
-    pub version: String,
-    pub pid: i64,
-    pub features: Vec<String>,
-}
-
-#[derive(Clone, Deserialize, Serialize, Default, Debug)]
-pub struct VmCoredumpData {
-    /// The coredump destination file
-    pub destination_url: String,
 }
 
 /// Memory transfer mode for a migration.

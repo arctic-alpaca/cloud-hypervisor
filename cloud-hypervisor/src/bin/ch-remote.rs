@@ -947,7 +947,7 @@ fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
 }
 
 fn coredump_config(destination_url: &str) -> String {
-    let coredump_config = api::VmCoredumpData {
+    let coredump_config = api::types::VmCoredumpData {
         destination_url: String::from(destination_url),
     };
 
