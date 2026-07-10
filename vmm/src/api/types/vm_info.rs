@@ -6,7 +6,17 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use vm_device::Resource;
 
+use crate::vm_config::VmConfig;
 use crate::{device_tree, vm};
+
+#[serde_with::skip_serializing_none]
+#[derive(Clone, Deserialize, Serialize)]
+pub struct VmInfoResponse {
+    pub config: Box<VmConfig>,
+    pub state: VmState,
+    pub memory_actual_size: u64,
+    pub device_tree: Option<DeviceTree>,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum VmState {
