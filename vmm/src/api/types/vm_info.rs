@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::result;
 
 use pci::PciBdf;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
+use vm_device::Resource;
 
-use crate::vm;
+use crate::{device_tree, vm};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum VmState {
@@ -52,6 +54,42 @@ impl From<crate::PciDeviceInfo> for PciDeviceInfo {
         Self {
             id: value.id,
             bdf: value.bdf,
+        }
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct DeviceTree(HashMap<String, DeviceNode>);
+
+impl From<device_tree::DeviceTree> for DeviceTree {
+    fn from(value: device_tree::DeviceTree) -> Self {
+        Self(
+            value
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone().into()))
+                .collect(),
+        )
+    }
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DeviceNode {
+    pub id: String,
+    pub resources: Vec<Resource>,
+    pub parent: Option<String>,
+    pub children: Vec<String>,
+    pub pci_bdf: Option<PciBdf>,
+}
+
+impl From<device_tree::DeviceNode> for DeviceNode {
+    fn from(value: device_tree::DeviceNode) -> Self {
+        Self {
+            id: value.id,
+            resources: value.resources,
+            parent: value.parent,
+            children: value.children,
+            pci_bdf: value.pci_bdf,
         }
     }
 }

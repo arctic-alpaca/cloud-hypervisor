@@ -2517,7 +2517,7 @@ impl RequestHandler for Vmm {
             config: Box::new(vm_config),
             state: state.into(),
             memory_actual_size,
-            device_tree,
+            device_tree: device_tree.map(Into::into),
         })
     }
 

@@ -12,6 +12,9 @@ use vm_migration::Migratable;
 
 use crate::device_manager::PciDeviceHandle;
 
+// TODO(#8577): Split device-manager snapshot DeviceTree/DeviceNode types from
+// runtime DeviceTree/DeviceNode so serde is not required on internal state.
+// <https://github.com/cloud-hypervisor/cloud-hypervisor/issues/8577>
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceNode {
@@ -53,6 +56,9 @@ macro_rules! device_node {
     };
 }
 
+// TODO(#8577): Split device-manager snapshot DeviceTree/DeviceNode types from
+// runtime DeviceTree/DeviceNode so serde is not required on internal state.
+// <https://github.com/cloud-hypervisor/cloud-hypervisor/issues/8577>
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct DeviceTree(HashMap<String, DeviceNode>);
 
