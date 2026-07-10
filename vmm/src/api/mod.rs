@@ -32,6 +32,7 @@
 #[cfg(feature = "dbus_api")]
 pub mod dbus;
 pub mod http;
+pub mod types;
 
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -53,6 +54,7 @@ use vmm_sys_util::eventfd::EventFd;
 pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
+use crate::api::types::{VmResizeData, VmResizeDiskData, VmResizeZoneData};
 use crate::config::RestoreConfig;
 use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
@@ -233,25 +235,6 @@ pub struct VmmPingResponse {
     pub version: String,
     pub pid: i64,
     pub features: Vec<String>,
-}
-
-#[derive(Clone, Deserialize, Serialize, Default, Debug)]
-pub struct VmResizeData {
-    pub desired_vcpus: Option<u32>,
-    pub desired_ram: Option<u64>,
-    pub desired_balloon: Option<u64>,
-}
-
-#[derive(Clone, Deserialize, Serialize, Default, Debug)]
-pub struct VmResizeDiskData {
-    pub id: String,
-    pub desired_size: u64,
-}
-
-#[derive(Clone, Deserialize, Serialize, Default, Debug)]
-pub struct VmResizeZoneData {
-    pub id: String,
-    pub desired_ram: u64,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]

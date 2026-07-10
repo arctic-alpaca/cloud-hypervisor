@@ -806,7 +806,7 @@ fn resize_config(
         None
     };
 
-    let resize = api::VmResizeData {
+    let resize = api::types::VmResizeData {
         desired_vcpus,
         desired_ram,
         desired_balloon,
@@ -816,7 +816,7 @@ fn resize_config(
 }
 
 fn resize_disk_config(id: &str, size: &str) -> Result<String, Error> {
-    let resize_disk = api::VmResizeDiskData {
+    let resize_disk = api::types::VmResizeDiskData {
         id: id.to_owned(),
         desired_size: size.parse::<ByteSized>().map_err(Error::InvalidDiskSize)?.0,
     };
@@ -825,7 +825,7 @@ fn resize_disk_config(id: &str, size: &str) -> Result<String, Error> {
 }
 
 fn resize_zone_config(id: &str, size: &str) -> Result<String, Error> {
-    let resize_zone = api::VmResizeZoneData {
+    let resize_zone = api::types::VmResizeZoneData {
         id: id.to_owned(),
         desired_ram: size
             .parse::<ByteSized>()
