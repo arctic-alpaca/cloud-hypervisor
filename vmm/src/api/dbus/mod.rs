@@ -293,7 +293,8 @@ impl DBusApi {
     }
 
     async fn vm_send_migration(&self, send_migration_data: String) -> Result<()> {
-        let send_migration_data = serde_json::from_str(&send_migration_data).map_err(api_error)?;
+        let send_migration_data: api::types::VmSendMigrationData =
+            serde_json::from_str(&send_migration_data).map_err(api_error)?;
         self.vm_action(&VmSendMigration, send_migration_data)
             .await
             .map(|_| ())

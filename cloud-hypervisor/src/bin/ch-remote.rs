@@ -20,7 +20,7 @@ use api_client::{
 use clap::ArgAction;
 use clap::{Arg, ArgMatches, Command};
 use log::error;
-use option_parser::{ByteSized, ByteSizedParseError};
+use option_parser::{ByteSized, ByteSizedParseError, OptionParserError};
 use thiserror::Error;
 use vmm::api;
 use vmm::config::{self};
@@ -73,9 +73,9 @@ enum Error {
     #[error("Invalid disk size")]
     InvalidDiskSize(#[source] ByteSizedParseError),
     #[error("Error parsing receive migration configuration")]
-    ReceiveMigrationConfig(#[from] api::VmReceiveMigrationConfigError),
+    ReceiveMigrationConfig(#[source] OptionParserError),
     #[error("Error parsing send migration configuration")]
-    SendMigrationConfig(#[from] api::VmSendMigrationConfigError),
+    SendMigrationConfig(#[source] OptionParserError),
 }
 
 enum TargetApi<'a> {
@@ -956,13 +956,13 @@ fn coredump_config(destination_url: &str) -> String {
 
 fn receive_migration_data(config: &str) -> Result<String, Error> {
     let receive_migration_data =
-        api::VmReceiveMigrationData::parse(config).map_err(Error::ReceiveMigrationConfig)?;
+        api::types::VmReceiveMigrationData::parse(config).map_err(Error::ReceiveMigrationConfig)?;
     Ok(serde_json::to_string(&receive_migration_data).unwrap())
 }
 
 fn send_migration_data(config: &str) -> Result<String, Error> {
     let send_migration_data =
-        api::VmSendMigrationData::parse(config).map_err(Error::SendMigrationConfig)?;
+        api::types::VmSendMigrationData::parse(config).map_err(Error::SendMigrationConfig)?;
     let send_migration_config = serde_json::to_string(&send_migration_data).unwrap();
     Ok(send_migration_config)
 }
@@ -1072,7 +1072,7 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
             .arg(
                 Arg::new("receive_migration_config")
                     .index(1)
-                    .help(api::VmReceiveMigrationData::SYNTAX),
+                    .help(api::types::VmReceiveMigrationData::SYNTAX),
             ),
         Command::new("remove-device")
             .about("Remove VFIO and PCI device")
@@ -1139,7 +1139,7 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
             .arg(
                 Arg::new("send_migration_config")
                     .index(1)
-                    .help(api::VmSendMigrationData::SYNTAX),
+                    .help(api::types::VmSendMigrationData::SYNTAX),
             ),
         Command::new("shutdown").about("Shutdown the VM"),
         Command::new("shutdown-vmm").about("Shutdown the VMM"),

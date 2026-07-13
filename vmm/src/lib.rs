@@ -47,10 +47,7 @@ use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::types::{VmInfoResponse, VmmPingResponse};
-use crate::api::{
-    ApiRequest, ApiResponse, MigrationMode, RequestHandler, TimeoutStrategy,
-    VmReceiveMigrationData, VmSendMigrationData,
-};
+use crate::api::{ApiRequest, ApiResponse, RequestHandler};
 use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
@@ -65,7 +62,10 @@ use crate::migration::transport::{
 use crate::migration::worker::{
     MigrationSeccompFilters, MigrationWorker, MigrationWorkerHandle, MigrationWorkerResult,
 };
-use crate::migration::{recv_vm_config, recv_vm_state};
+use crate::migration::{
+    MigrationMode, TimeoutStrategy, VmReceiveMigrationData, VmSendMigrationData, recv_vm_config,
+    recv_vm_state,
+};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::vm::{Error as VmError, Vm, VmState};
 use crate::vm_config::{
@@ -2984,11 +2984,6 @@ impl RequestHandler for Vmm {
             VmOwnership::None => {}
         }
 
-        receive_data_migration
-            .validate()
-            .context("Invalid receive migration configuration")
-            .map_err(MigratableError::MigrateReceive)?;
-
         info!(
             "Receiving migration: receiver_url={},tls={}",
             receive_data_migration.receiver_url,
@@ -3095,11 +3090,6 @@ impl RequestHandler for Vmm {
                 return Err(MigratableError::MigrateSend(anyhow!("VM is not running")));
             }
         }
-
-        send_data_migration
-            .validate()
-            .context("Invalid send migration configuration")
-            .map_err(MigratableError::MigrateSend)?;
 
         info!(
             "Sending migration: destination_url={},local={},tls={},downtime={}ms,timeout={}s,timeout_strategy={:?}",
