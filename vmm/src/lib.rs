@@ -28,10 +28,8 @@ use hypervisor::arch::x86;
 use landlock::LandlockError;
 use libc::{EFD_NONBLOCK, SIGINT, SIGTERM, TCSANOW, tcsetattr, termios};
 use log::{debug, error, info, warn};
-use memory_manager::MemoryManagerSnapshotData;
 use pci::PciBdf;
 use seccompiler::{BpfProgram, SeccompAction, apply_filter};
-use serde::{Deserialize, Serialize};
 use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
 use tracer::trace_scoped;
@@ -62,9 +60,9 @@ use crate::migration::transport::{
 use crate::migration::worker::{
     MigrationSeccompFilters, MigrationWorker, MigrationWorkerHandle, MigrationWorkerResult,
 };
-use crate::migration::{
-    MigrationMode, TimeoutStrategy, VmReceiveMigrationData, VmSendMigrationData, recv_vm_config,
-    recv_vm_state,
+pub use crate::migration::{
+    MigrationMode, TimeoutStrategy, VmMigrationConfig, VmReceiveMigrationData, VmSendMigrationData,
+    recv_vm_config, recv_vm_state,
 };
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::vm::{Error as VmError, Vm, VmState};
@@ -574,20 +572,6 @@ where
     let value = f()?;
     let duration = begin.elapsed();
     Ok((value, duration))
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct VmMigrationConfig {
-    vm_config: Arc<Mutex<VmConfig>>,
-    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-    common_cpuid: Vec<x86::CpuIdEntry>,
-    memory_manager_data: MemoryManagerSnapshotData,
-}
-
-impl VmMigrationConfig {
-    pub fn memory_manager_data(&self) -> &MemoryManagerSnapshotData {
-        &self.memory_manager_data
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1145,8 +1129,12 @@ impl Vmm {
             .read_exact(&mut data)
             .map_err(MigratableError::MigrateSocket)?;
 
-        let vm_migration_config: VmMigrationConfig = serde_json::from_slice(&data)
+        let vm_migration_config: migration::wire::VmMigrationConfig = serde_json::from_slice(&data)
             .context("Error deserialising config")
+            .map_err(MigratableError::MigrateReceive)?;
+        let vm_migration_config: migration::VmMigrationConfig = vm_migration_config
+            .try_into()
+            .context("Invalid VM configuration in migration")
             .map_err(MigratableError::MigrateReceive)?;
 
         // Eager prefault populates memory before UFFD is registered, so those
@@ -2336,9 +2324,12 @@ impl RequestHandler for Vmm {
                 // Safe to unwrap as we checked it was Some(&str).
                 let source_url = source_url.unwrap();
 
-                let vm_config = Arc::new(Mutex::new(
-                    recv_vm_config(source_url).map_err(VmError::Restore)?,
-                ));
+                let vm_config: VmConfig = recv_vm_config(source_url)
+                    .map_err(VmError::Restore)?
+                    .try_into()
+                    .map_err(VmError::ConfigValidation)?;
+
+                let vm_config = Arc::new(Mutex::new(vm_config));
                 restore_cfg
                     .validate(&vm_config.lock().unwrap().clone())
                     .map_err(VmError::ConfigValidation)?;
@@ -2514,7 +2505,7 @@ impl RequestHandler for Vmm {
         };
 
         Ok(VmInfoResponse {
-            config: Box::new(vm_config),
+            config: Box::new((&vm_config).into()),
             state: state.into(),
             memory_actual_size,
             device_tree: device_tree.map(Into::into),
@@ -3380,7 +3371,9 @@ mod unit_tests {
     #[test]
     fn test_vmm_vm_cold_add_device() {
         let mut vmm = create_dummy_vmm();
-        let device_config = DeviceConfig::parse("path=/path/to/device").unwrap();
+        let device_config: DeviceConfig = api::types::DeviceConfig::parse("path=/path/to/device")
+            .unwrap()
+            .into();
 
         assert!(matches!(
             vmm.vm_add_device(device_config.clone()),
@@ -3427,7 +3420,10 @@ mod unit_tests {
     #[test]
     fn test_vmm_vm_cold_add_user_device() {
         let mut vmm = create_dummy_vmm();
-        let user_device_config = UserDeviceConfig::parse("socket=/path/to/socket,id=8").unwrap();
+        let user_device_config: UserDeviceConfig =
+            api::types::UserDeviceConfig::parse("socket=/path/to/socket,id=8")
+                .unwrap()
+                .into();
 
         assert!(matches!(
             vmm.vm_add_user_device(user_device_config.clone()),
@@ -3478,7 +3474,9 @@ mod unit_tests {
     #[test]
     fn test_vmm_vm_cold_add_disk() {
         let mut vmm = create_dummy_vmm();
-        let disk_config = DiskConfig::parse("path=/path/to_file").unwrap();
+        let disk_config: DiskConfig = api::types::DiskConfig::parse("path=/path/to_file")
+            .unwrap()
+            .into();
 
         assert!(matches!(
             vmm.vm_add_disk(disk_config.clone()),
@@ -3525,7 +3523,9 @@ mod unit_tests {
     #[test]
     fn test_vmm_vm_cold_add_fs() {
         let mut vmm = create_dummy_vmm();
-        let fs_config = FsConfig::parse("tag=mytag,socket=/tmp/sock").unwrap();
+        let fs_config: FsConfig = api::types::FsConfig::parse("tag=mytag,socket=/tmp/sock")
+            .unwrap()
+            .into();
 
         assert!(matches!(
             vmm.vm_add_fs(fs_config.clone()),
@@ -3564,9 +3564,12 @@ mod unit_tests {
     #[test]
     fn test_vmm_vm_cold_add_generic_vhost_user() {
         let mut vmm = create_dummy_vmm();
-        let generic_vhost_user_config =
-            GenericVhostUserConfig::parse("device_type=26,socket=/tmp/sock,queue_sizes=[1024]")
-                .unwrap();
+        let generic_vhost_user_config: GenericVhostUserConfig =
+            api::types::GenericVhostUserConfig::parse(
+                "device_type=26,socket=/tmp/sock,queue_sizes=[1024]",
+            )
+            .unwrap()
+            .into();
 
         assert!(matches!(
             vmm.vm_add_generic_vhost_user(generic_vhost_user_config.clone()),
@@ -3617,7 +3620,9 @@ mod unit_tests {
     #[test]
     fn test_vmm_vm_cold_add_pmem() {
         let mut vmm = create_dummy_vmm();
-        let pmem_config = PmemConfig::parse("file=/tmp/pmem,size=128M").unwrap();
+        let pmem_config: PmemConfig = api::types::PmemConfig::parse("file=/tmp/pmem,size=128M")
+            .unwrap()
+            .into();
 
         assert!(matches!(
             vmm.vm_add_pmem(pmem_config.clone()),
@@ -3664,10 +3669,11 @@ mod unit_tests {
     #[test]
     fn test_vmm_vm_cold_add_net() {
         let mut vmm = create_dummy_vmm();
-        let net_config = NetConfig::parse(
+        let net_config: NetConfig = api::types::NetConfig::parse(
             "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock",
         )
-        .unwrap();
+        .unwrap()
+        .into();
 
         assert!(matches!(
             vmm.vm_add_net(net_config.clone()),
@@ -3714,7 +3720,10 @@ mod unit_tests {
     #[test]
     fn test_vmm_vm_cold_add_vdpa() {
         let mut vmm = create_dummy_vmm();
-        let vdpa_config = VdpaConfig::parse("path=/dev/vhost-vdpa,num_queues=2").unwrap();
+        let vdpa_config: VdpaConfig =
+            api::types::VdpaConfig::parse("path=/dev/vhost-vdpa,num_queues=2")
+                .unwrap()
+                .into();
 
         assert!(matches!(
             vmm.vm_add_vdpa(vdpa_config.clone()),
@@ -3761,7 +3770,10 @@ mod unit_tests {
     #[test]
     fn test_vmm_vm_cold_add_vsock() {
         let mut vmm = create_dummy_vmm();
-        let vsock_config = VsockConfig::parse("socket=/tmp/sock,cid=3,iommu=on").unwrap();
+        let vsock_config: VsockConfig =
+            api::types::VsockConfig::parse("socket=/tmp/sock,cid=3,iommu=on")
+                .unwrap()
+                .into();
 
         assert!(matches!(
             vmm.vm_add_vsock(vsock_config.clone()),

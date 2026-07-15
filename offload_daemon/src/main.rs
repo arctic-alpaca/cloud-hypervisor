@@ -36,9 +36,10 @@ use vm_memory::{
 };
 use vm_migration::MigratableError;
 use vm_migration::protocol::{Command, ConnectionRole, MemoryRange, Request, Response, Status};
-use vmm::VmMigrationConfig;
+use vmm::config::ValidationError;
 use vmm::migration::SNAPSHOT_STATE_FILE;
 use vmm::sparse::copy_region;
+use vmm::{VmMigrationConfig, migration};
 use vmm_sys_util::errno;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -250,7 +251,13 @@ fn run_snapshot(socket_path: &Path, output_dir: &Path) -> Result<()> {
             Command::Config => {
                 let mut buf = vec![0u8; req.length() as usize];
                 stream.read_exact(&mut buf).map_err(Error::ReadPayload)?;
-                migration_config = Some(serde_json::from_slice(&buf)?);
+                migration_config = Some(
+                    serde_json::from_slice::<migration::wire::VmMigrationConfig>(&buf)?
+                        .try_into()
+                        .map_err(|error: ValidationError| {
+                            Error::Protocol(MigratableError::MigrateReceive(error.into()))
+                        })?,
+                );
                 fs::write(output_dir.join(MIGRATION_CONFIG_FILENAME), &buf)
                     .map_err(Error::WriteFile)?;
                 Response::ok()
@@ -397,7 +404,12 @@ fn parse_guest_ram_mappings(value: &serde_json::Value) -> Result<Vec<(u32, u64, 
 fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: bool) -> Result<()> {
     let migration_config_bytes =
         fs::read(input_dir.join(MIGRATION_CONFIG_FILENAME)).map_err(Error::ReadFile)?;
-    let migration_config: VmMigrationConfig = serde_json::from_slice(&migration_config_bytes)?;
+    let migration_config: VmMigrationConfig =
+        serde_json::from_slice::<migration::wire::VmMigrationConfig>(&migration_config_bytes)?
+            .try_into()
+            .map_err(|error: ValidationError| {
+                Error::Protocol(MigratableError::MigrateSend(error.into()))
+            })?;
     let state_bytes = fs::read(input_dir.join(SNAPSHOT_STATE_FILE)).map_err(Error::ReadFile)?;
 
     let mut stream = UnixStream::connect(socket_path).map_err(Error::Connect)?;

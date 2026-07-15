@@ -31,6 +31,7 @@ use vm_migration::tls::{TlsServerConfig, TlsStream};
 use vm_migration::{MigratableError, Snapshot};
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::migration::wire;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::sync_utils::Gate;
 use crate::{GuestMemoryMmap, VmMigrationConfig};
@@ -1134,7 +1135,8 @@ pub(crate) fn send_config(
     socket: &mut SocketStream,
     config: &VmMigrationConfig,
 ) -> Result<(), MigratableError> {
-    let config_data = serde_json::to_vec(config)
+    let config: wire::VmMigrationConfig = config.into();
+    let config_data = serde_json::to_vec(&config)
         .context("Error serializing VM migration config")
         .map_err(MigratableError::MigrateSend)?;
     Request::config(config_data.len() as u64).write_to(socket)?;

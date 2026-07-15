@@ -8,11 +8,22 @@ mod vm_restore;
 mod vm_snapshot;
 mod vmm_ping;
 
+#[cfg(feature = "fw_cfg")]
+pub use vm_config::FwCfgConfig;
+#[cfg(feature = "ivshmem")]
+pub use vm_config::IvshmemConfig;
+pub use vm_config::{
+    BalloonConfig, ConsoleConfig, DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig,
+    LandlockConfig, NetConfig, NumaConfig, PciDeviceCommonConfig, PciSegmentConfig, PlatformConfig,
+    PmemConfig, RateLimiterGroupConfig, RngConfig, RtcConfig, SerialConfig, TpmConfig,
+    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+};
 pub use vm_coredump::VmCoredumpData;
 pub use vm_device::VmRemoveDeviceData;
 pub use vm_info::{DeviceNode, DeviceTree, PciDeviceInfo, VmInfoResponse, VmState};
-pub use vm_migration::{MigrationMode, TimeoutStrategy, VmReceiveMigrationData, VmSendMigrationData};
-pub use vm_config::PciDeviceCommonConfig;
+pub use vm_migration::{
+    MigrationMode, TimeoutStrategy, VmReceiveMigrationData, VmSendMigrationData,
+};
 pub use vm_resize::{VmResizeData, VmResizeDiskData, VmResizeZoneData};
 pub use vm_restore::{
     MemoryRestoreMode, MemoryRestoreModeParseError, ParseRestoreError, RestoreConfig,

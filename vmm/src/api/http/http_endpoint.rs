@@ -41,21 +41,21 @@ use std::sync::mpsc::Sender;
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::api;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::api::VmCoredump;
 use crate::api::http::http_endpoint::fds_helper::{attach_fds_to_cfg, attach_fds_to_cfgs};
 use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
-    AddDisk, ApiAction, ApiError, ApiRequest, DeviceConfig, NetConfig, VmAddDevice, VmAddFs,
-    VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
-    VmShutdown, VmSnapshot,
+    AddDisk, ApiAction, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser,
+    VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmConfig, VmCounters,
+    VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice,
+    VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown,
+    VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
 use crate::vm::Error as VmError;
+use crate::{api, vm_config};
 
 /// Helper module for attaching externally opened FDs to config objects.
 ///
@@ -120,8 +120,37 @@ mod fds_helper {
         use std::slice::from_ref;
 
         use super::{ConfigWithFDs, ConfigWithVariableFDs};
+        use crate::api;
         use crate::config::RestoredNetConfig;
         use crate::vm_config::{DeviceConfig, NetConfig};
+
+        impl ConfigWithFDs for api::types::NetConfig {
+            fn id(&self) -> Option<&str> {
+                self.pci_common.id.as_deref()
+            }
+
+            fn fds_from_http_body(&self) -> Option<&[RawFd]> {
+                self.fds.as_deref()
+            }
+
+            fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
+                self.fds = fds;
+            }
+        }
+
+        impl ConfigWithFDs for api::types::DeviceConfig {
+            fn id(&self) -> Option<&str> {
+                self.pci_common.id.as_deref()
+            }
+
+            fn fds_from_http_body(&self) -> Option<&[RawFd]> {
+                self.fd.as_ref().map(from_ref)
+            }
+
+            fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
+                self.fd = fds.and_then(|mut v| v.pop());
+            }
+        }
 
         impl ConfigWithFDs for NetConfig {
             fn id(&self) -> Option<&str> {
@@ -293,12 +322,13 @@ impl EndpointHandler for VmCreate {
                 match &req.body {
                     Some(body) => {
                         // Deserialize into a VmConfig
-                        let mut vm_config: Box<VmConfig> = match serde_json::from_slice(body.raw())
-                            .map_err(HttpError::SerdeJsonDeserialize)
-                        {
-                            Ok(config) => config,
-                            Err(e) => return error_response(e),
-                        };
+                        let mut vm_config: api::types::VmConfig =
+                            match serde_json::from_slice(body.raw())
+                                .map_err(HttpError::SerdeJsonDeserialize)
+                            {
+                                Ok(config) => config,
+                                Err(e) => return error_response(e),
+                            };
 
                         if let Some(ref mut nets) = vm_config.net {
                             let mut cfgs = nets.iter_mut().collect::<Vec<&mut _>>();
@@ -328,6 +358,15 @@ impl EndpointHandler for VmCreate {
                                 }
                             }
                         }
+
+                        let vm_config: Box<VmConfig> = match vm_config.try_into() {
+                            Ok(config) => Box::new(config),
+                            Err(error) => {
+                                return error_response(HttpError::ApiError(ApiError::VmCreate(
+                                    VmError::ConfigValidation(error),
+                                )));
+                            }
+                        };
 
                         match api::VmCreate
                             .send(api_notifier, api_sender, vm_config)
@@ -483,7 +522,8 @@ impl PutHandler for VmAddDevice {
             if files.len() > 1 {
                 return Err(HttpError::BadRequest);
             }
-            let mut device_cfg: DeviceConfig = serde_json::from_slice(body.raw())?;
+            let device_cfg: api::types::DeviceConfig = serde_json::from_slice(body.raw())?;
+            let mut device_cfg: vm_config::DeviceConfig = device_cfg.into();
             attach_fds_to_cfg(files, &mut device_cfg)?;
 
             self.send(api_notifier, api_sender, device_cfg)
@@ -507,7 +547,9 @@ impl PutHandler for VmAddNet {
         files: Vec<File>,
     ) -> result::Result<Option<Body>, HttpError> {
         if let Some(body) = body {
-            let mut net_cfg: NetConfig = serde_json::from_slice(body.raw())?;
+            let net_cfg: api::types::NetConfig = serde_json::from_slice(body.raw())?;
+            let mut net_cfg: vm_config::NetConfig = net_cfg.into();
+
             attach_fds_to_cfg(files, &mut net_cfg)?;
 
             self.send(api_notifier, api_sender, net_cfg)

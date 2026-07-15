@@ -420,7 +420,7 @@ impl ApiAction for VmAddDevice {
 pub struct AddDisk;
 
 impl ApiAction for AddDisk {
-    type RequestBody = DiskConfig;
+    type RequestBody = api::types::DiskConfig;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -432,7 +432,7 @@ impl ApiAction for AddDisk {
             info!("API request event: AddDisk {config:?}");
 
             let response = vmm
-                .vm_add_disk(config)
+                .vm_add_disk(config.into())
                 .map_err(ApiError::VmAddDisk)
                 .map(ApiResponsePayload::VmAction);
 
@@ -457,7 +457,7 @@ impl ApiAction for AddDisk {
 pub struct VmAddFs;
 
 impl ApiAction for VmAddFs {
-    type RequestBody = FsConfig;
+    type RequestBody = api::types::FsConfig;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -469,7 +469,7 @@ impl ApiAction for VmAddFs {
             info!("API request event: VmAddFs {config:?}");
 
             let response = vmm
-                .vm_add_fs(config)
+                .vm_add_fs(config.into())
                 .map_err(ApiError::VmAddFs)
                 .map(ApiResponsePayload::VmAction);
 
@@ -494,7 +494,7 @@ impl ApiAction for VmAddFs {
 pub struct VmAddGenericVhostUser;
 
 impl ApiAction for VmAddGenericVhostUser {
-    type RequestBody = GenericVhostUserConfig;
+    type RequestBody = api::types::GenericVhostUserConfig;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -506,7 +506,7 @@ impl ApiAction for VmAddGenericVhostUser {
             info!("API request event: VmAddGenericVhostUser {config:?}");
 
             let response = vmm
-                .vm_add_generic_vhost_user(config)
+                .vm_add_generic_vhost_user(config.into())
                 .map_err(ApiError::VmAddGenericVhostUser)
                 .map(ApiResponsePayload::VmAction);
 
@@ -531,7 +531,7 @@ impl ApiAction for VmAddGenericVhostUser {
 pub struct VmAddPmem;
 
 impl ApiAction for VmAddPmem {
-    type RequestBody = PmemConfig;
+    type RequestBody = api::types::PmemConfig;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -543,7 +543,7 @@ impl ApiAction for VmAddPmem {
             info!("API request event: VmAddPmem {config:?}");
 
             let response = vmm
-                .vm_add_pmem(config)
+                .vm_add_pmem(config.into())
                 .map_err(ApiError::VmAddPmem)
                 .map(ApiResponsePayload::VmAction);
 
@@ -605,7 +605,7 @@ impl ApiAction for VmAddNet {
 pub struct VmAddVdpa;
 
 impl ApiAction for VmAddVdpa {
-    type RequestBody = VdpaConfig;
+    type RequestBody = api::types::VdpaConfig;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -617,7 +617,7 @@ impl ApiAction for VmAddVdpa {
             info!("API request event: VmAddVdpa {config:?}");
 
             let response = vmm
-                .vm_add_vdpa(config)
+                .vm_add_vdpa(config.into())
                 .map_err(ApiError::VmAddVdpa)
                 .map(ApiResponsePayload::VmAction);
 
@@ -642,7 +642,7 @@ impl ApiAction for VmAddVdpa {
 pub struct VmAddVsock;
 
 impl ApiAction for VmAddVsock {
-    type RequestBody = VsockConfig;
+    type RequestBody = api::types::VsockConfig;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -654,7 +654,7 @@ impl ApiAction for VmAddVsock {
             info!("API request event: VmAddVsock {config:?}");
 
             let response = vmm
-                .vm_add_vsock(config)
+                .vm_add_vsock(config.into())
                 .map_err(ApiError::VmAddVsock)
                 .map(ApiResponsePayload::VmAction);
 
@@ -679,7 +679,7 @@ impl ApiAction for VmAddVsock {
 pub struct VmAddUserDevice;
 
 impl ApiAction for VmAddUserDevice {
-    type RequestBody = UserDeviceConfig;
+    type RequestBody = api::types::UserDeviceConfig;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -691,7 +691,7 @@ impl ApiAction for VmAddUserDevice {
             info!("API request event: VmAddUserDevice {config:?}");
 
             let response = vmm
-                .vm_add_user_device(config)
+                .vm_add_user_device(config.into())
                 .map_err(ApiError::VmAddUserDevice)
                 .map(ApiResponsePayload::VmAction);
 

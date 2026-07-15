@@ -7,9 +7,11 @@ use std::io::Read;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::result;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
+use hypervisor::arch::x86;
 use thiserror::Error;
 use vm_migration::tls::{TlsEndpoint, validate_tls_dir};
 use vm_migration::{MigratableError, Snapshot};
@@ -17,6 +19,7 @@ use vm_migration::{MigratableError, Snapshot};
 use crate::api;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggableError;
+use crate::memory_manager::MemoryManagerSnapshotData;
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
 };
@@ -24,10 +27,25 @@ use crate::vm::VmSnapshot;
 use crate::vm_config::VmConfig;
 
 pub(crate) mod transport;
+pub mod wire;
 pub(crate) mod worker;
 
 pub const SNAPSHOT_STATE_FILE: &str = "state.json";
 pub const SNAPSHOT_CONFIG_FILE: &str = "config.json";
+
+#[derive(Clone)]
+pub struct VmMigrationConfig {
+    pub vm_config: Arc<Mutex<VmConfig>>,
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    pub common_cpuid: Vec<x86::CpuIdEntry>,
+    pub(crate) memory_manager_data: MemoryManagerSnapshotData,
+}
+
+impl VmMigrationConfig {
+    pub fn memory_manager_data(&self) -> &MemoryManagerSnapshotData {
+        &self.memory_manager_data
+    }
+}
 
 pub fn url_to_path(url: &str) -> result::Result<PathBuf, MigratableError> {
     let path: PathBuf = url
@@ -58,7 +76,7 @@ pub fn url_to_file(url: &str) -> result::Result<PathBuf, GuestDebuggableError> {
     Ok(file)
 }
 
-pub fn recv_vm_config(source_url: &str) -> result::Result<VmConfig, MigratableError> {
+pub fn recv_vm_config(source_url: &str) -> result::Result<api::types::VmConfig, MigratableError> {
     let mut vm_config_path = url_to_path(source_url)?;
 
     vm_config_path.push(SNAPSHOT_CONFIG_FILE);

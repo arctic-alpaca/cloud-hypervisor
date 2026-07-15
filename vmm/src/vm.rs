@@ -120,7 +120,7 @@ use crate::vm_config::{
 };
 use crate::{
     CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemoryMmap,
-    MEMORY_MANAGER_SNAPSHOT_ID, PciDeviceInfo, acpi, cpu,
+    MEMORY_MANAGER_SNAPSHOT_ID, PciDeviceInfo, acpi, api, cpu,
 };
 
 /// Errors associated with VM management
@@ -3410,7 +3410,8 @@ impl Transportable for Vm {
             .map_err(MigratableError::MigrateSend)?;
 
         // Serialize and write the snapshot config
-        let vm_config = serde_json::to_string(self.config.lock().unwrap().deref())
+        let vm_config: api::types::VmConfig = self.config.lock().unwrap().deref().into();
+        let vm_config = serde_json::to_string(&vm_config)
             .context("Error serializing VM config snapshot")
             .map_err(MigratableError::MigrateSend)?;
 

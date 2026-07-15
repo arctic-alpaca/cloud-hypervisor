@@ -6,7 +6,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use vm_device::Resource;
 
-use crate::vm_config::VmConfig;
+use crate::api::types::VmConfig;
 use crate::{device_tree, vm};
 
 #[serde_with::skip_serializing_none]

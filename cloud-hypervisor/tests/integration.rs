@@ -48,7 +48,7 @@ mod common_parallel {
 
     use test_infra::GuestFactory;
     #[cfg(not(feature = "mshv"))]
-    use vmm::api::TimeoutStrategy;
+    use vmm::api::types::TimeoutStrategy;
 
     use crate::*;
 
