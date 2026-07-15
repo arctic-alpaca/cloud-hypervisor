@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::Error;
 use crate::vm_config;
 
+mod cpus;
+pub use cpus::CpusConfig;
+
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct PciDeviceCommonConfig {
