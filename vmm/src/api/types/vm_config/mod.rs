@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use crate::config::Error;
 use crate::vm_config;
 
+mod balloon;
 mod console;
 mod cpus;
+mod devices;
 mod disk;
 mod fs_config;
 mod generic_vhost_user;
@@ -18,9 +20,14 @@ mod pmem;
 mod rate_limiter_group;
 mod rng;
 
+pub use balloon::BalloonConfig;
 pub use console::{ConsoleConfig, DebugConsoleConfig, SerialConfig};
 pub use cpus::CpusConfig;
 pub use disk::DiskConfig;
+pub use devices::{
+    DeviceConfig, IvshmemConfig, LandlockConfig, PciSegmentConfig, PvmemcontrolConfig, RtcConfig,
+    TpmConfig, UserDeviceConfig, VdpaConfig, VsockConfig,
+};
 pub use fs_config::FsConfig;
 pub use generic_vhost_user::GenericVhostUserConfig;
 pub use memory::MemoryConfig;
