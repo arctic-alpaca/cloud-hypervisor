@@ -7,7 +7,10 @@ use crate::vm_config;
 mod console;
 mod cpus;
 mod disk;
+mod fs_config;
+mod generic_vhost_user;
 mod memory;
+mod net;
 mod numa;
 mod payload;
 mod platform;
@@ -18,7 +21,10 @@ mod rng;
 pub use console::{ConsoleConfig, DebugConsoleConfig, SerialConfig};
 pub use cpus::CpusConfig;
 pub use disk::DiskConfig;
+pub use fs_config::FsConfig;
+pub use generic_vhost_user::GenericVhostUserConfig;
 pub use memory::MemoryConfig;
+pub use net::NetConfig;
 pub use numa::NumaConfig;
 pub use payload::{FwCfgConfig, PayloadConfig};
 pub use platform::PlatformConfig;
@@ -62,6 +68,7 @@ impl From<&vm_config::PciDeviceCommonConfig> for PciDeviceCommonConfig {
 }
 
 impl PciDeviceCommonConfig {
+    const OPTIONS: &[&str] = &["id", "pci_segment", "pci_device_id"];
     pub(crate) const OPTIONS_IOMMU: &[&str] = &["id", "iommu", "pci_segment", "pci_device_id"];
 
     pub fn parse(input: &str) -> Result<Self, Error> {
