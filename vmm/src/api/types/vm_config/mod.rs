@@ -4,14 +4,18 @@ use serde::{Deserialize, Serialize};
 use crate::config::Error;
 use crate::vm_config;
 
+mod console;
 mod cpus;
 mod memory;
 mod numa;
+mod payload;
 mod platform;
 
+pub use console::{ConsoleConfig, DebugConsoleConfig, SerialConfig};
 pub use cpus::CpusConfig;
 pub use memory::MemoryConfig;
 pub use numa::NumaConfig;
+pub use payload::{FwCfgConfig, PayloadConfig};
 pub use platform::PlatformConfig;
 
 #[serde_with::skip_serializing_none]
