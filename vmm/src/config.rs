@@ -30,7 +30,7 @@ use crate::landlock::LandlockAccess;
 use crate::vm_config::*;
 
 const MAX_NUM_PCI_SEGMENTS: u16 = 96;
-const MAX_IOMMU_ADDRESS_WIDTH_BITS: u8 = 64;
+pub(crate) const MAX_IOMMU_ADDRESS_WIDTH_BITS: u8 = 64;
 
 // Maximum queue size is largest power of 2 that fits into a u16
 const VIRTIO_MAX_QUEUE_SIZE: u16 = 32768;
