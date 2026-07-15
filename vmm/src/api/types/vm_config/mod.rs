@@ -6,17 +6,25 @@ use crate::vm_config;
 
 mod console;
 mod cpus;
+mod disk;
 mod memory;
 mod numa;
 mod payload;
 mod platform;
+mod pmem;
+mod rate_limiter_group;
+mod rng;
 
 pub use console::{ConsoleConfig, DebugConsoleConfig, SerialConfig};
 pub use cpus::CpusConfig;
+pub use disk::DiskConfig;
 pub use memory::MemoryConfig;
 pub use numa::NumaConfig;
 pub use payload::{FwCfgConfig, PayloadConfig};
 pub use platform::PlatformConfig;
+pub use pmem::PmemConfig;
+pub use rate_limiter_group::RateLimiterGroupConfig;
+pub use rng::RngConfig;
 
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
