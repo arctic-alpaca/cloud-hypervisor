@@ -1,4 +1,4 @@
-use option_parser::{IntegerList, OptionParser, OptionParserError, StringList, Tuple};
+use option_parser::{IntegerList, OptionParser, OptionParserError, StringList, Tuple, TupleList};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Error;
@@ -91,11 +91,11 @@ impl NumaConfig {
             .map_err(Error::ParseNuma)?
             .map(|v| v.0.iter().map(|e| *e as u32).collect());
         let distances = parser
-            .convert::<Tuple<u64, u64>>("distances")
+            .convert::<TupleList<u64, u64>>("distances")
             .map_err(Error::ParseNuma)?
             .map(|v| {
                 v.0.iter()
-                    .map(|(e1, e2)| NumaDistance {
+                    .map(|Tuple(e1, e2)| NumaDistance {
                         destination: *e1 as u32,
                         distance: *e2 as u8,
                     })

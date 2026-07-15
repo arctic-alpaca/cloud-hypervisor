@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use block::ImageType;
 use block::fcntl::LockGranularityChoice;
-use option_parser::{OptionParser, Toggle, Tuple};
+use option_parser::{OptionParser, Toggle, Tuple, TupleList};
 use serde::{Deserialize, Serialize};
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
 
@@ -219,11 +219,11 @@ impl DiskConfig {
             .unwrap_or_default();
         let serial = parser.get("serial");
         let queue_affinity = parser
-            .convert::<Tuple<u16, Vec<usize>>>("queue_affinity")
+            .convert::<TupleList<u16, Vec<usize>>>("queue_affinity")
             .map_err(Error::ParseDisk)?
             .map(|v| {
                 v.0.iter()
-                    .map(|(e1, e2)| VirtQueueAffinity {
+                    .map(|Tuple(e1, e2)| VirtQueueAffinity {
                         queue_index: *e1,
                         host_cpus: e2.clone().into_boxed_slice(),
                     })

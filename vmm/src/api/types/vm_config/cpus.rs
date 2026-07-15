@@ -2,7 +2,7 @@ use std::result;
 use std::str::FromStr;
 
 use arch::CpuProfile;
-use option_parser::{OptionParser, StringList, Toggle, Tuple};
+use option_parser::{OptionParser, StringList, Toggle, Tuple, TupleList};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Error;
@@ -115,11 +115,11 @@ impl CpusConfig {
             .map_err(Error::ParseCpus)?
             .unwrap_or(DEFAULT_MAX_PHYS_BITS);
         let affinity = parser
-            .convert::<Tuple<u32, Vec<usize>>>("affinity")
+            .convert::<TupleList<u32, Vec<usize>>>("affinity")
             .map_err(Error::ParseCpus)?
             .map(|v| {
                 v.0.iter()
-                    .map(|(e1, e2)| CpuAffinity {
+                    .map(|Tuple(e1, e2)| CpuAffinity {
                         vcpu: *e1,
                         host_cpus: e2.clone().into_boxed_slice(),
                     })
