@@ -17,6 +17,7 @@ pvmemcontrol = []
 
 [dependencies]
 arbitrary = "1.4.2"
+api-types = { path = "../api-types" }
 block = { path = "../block" }
 devices = { path = "../devices" }
 epoll = "4.4.0"
