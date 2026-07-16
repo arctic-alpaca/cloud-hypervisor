@@ -12,6 +12,7 @@ version = "54.0.0"
 
 [dependencies]
 api_client = { path = "../api_client" }
+api-types = { path = "../api-types" }
 clap = { workspace = true, features = ["string"] }
 dhat = { workspace = true, optional = true }
 env_logger = { workspace = true }
