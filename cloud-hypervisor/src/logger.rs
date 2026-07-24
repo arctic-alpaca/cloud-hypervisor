@@ -237,7 +237,9 @@ impl log::Log for Logger {
                     write!(&mut *out, "{}", zoned.strftime("%m%d %H:%M:%S%.6f"))
                 }
                 Token::LocalGlog => {
-                    let zoned = zoned_local.get_or_insert_with(jiff::Zoned::now);
+                    let zoned = zoned_local.get_or_insert_with(|| {
+                        jiff::Timestamp::now().to_zoned(self.local_tz.clone())
+                    });
                     write!(&mut *out, "{}", zoned.strftime("%m%d %H:%M:%S%.6f"))
                 }
                 Token::Pid => write!(&mut *out, "{}", self.pid),
@@ -260,7 +262,9 @@ impl log::Log for Logger {
                         Zone::Utc => zoned_utc.get_or_insert_with(|| {
                             jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC)
                         }),
-                        Zone::Local => zoned_local.get_or_insert_with(jiff::Zoned::now),
+                        Zone::Local => zoned_local.get_or_insert_with(|| {
+                            jiff::Timestamp::now().to_zoned(self.local_tz.clone())
+                        }),
                     };
                     write_time_field(&mut *out, *field, zoned)
                 }
