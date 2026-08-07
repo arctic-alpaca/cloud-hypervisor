@@ -1061,6 +1061,7 @@ mod unit_tests {
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
+            external_fds: Default::default(),
         };
 
         assert_eq!(expected_vm_config, result_vm_config);

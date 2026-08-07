@@ -18,6 +18,7 @@ use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
 
 use crate::Landlock;
+use crate::external_fds::ExternalFds;
 use crate::landlock::LandlockError;
 
 pub type LandlockResult<T> = result::Result<T, LandlockError>;
@@ -1136,6 +1137,8 @@ pub struct VmConfig {
     pub landlock_rules: Option<Box<[LandlockConfig]>>,
     #[cfg(feature = "ivshmem")]
     pub ivshmem: Option<IvshmemConfig>,
+    #[serde(default, flatten)]
+    pub external_fds: ExternalFds,
 }
 
 impl VmConfig {

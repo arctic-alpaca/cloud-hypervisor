@@ -4,6 +4,7 @@
 //
 
 use std::fs::File;
+use std::mem;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::str::FromStr;
 
@@ -11,7 +12,8 @@ use option_parser::Tuple;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::RestoredNetConfig;
+use crate::api::VmReceiveMigrationData;
+use crate::config::{RestoreConfig, RestoredNetConfig};
 use crate::vm_config::{NetConfig, VmConfig};
 
 /// TODO(fd)
@@ -261,6 +263,36 @@ impl IngestScmRights for ExternalFds {
                 IngestScmRightsError::TooManyFds,
             ))
         }
+    }
+}
+
+impl IngestScmRights for VmConfig {
+    fn ingest_fds(&mut self, fds: Vec<File>) -> Result<(), FdUpdateError> {
+        self.external_fds.ingest_fds(fds)?;
+        let external_fds = mem::take(&mut self.external_fds);
+        self.consume_fds(external_fds)
+    }
+}
+
+impl IngestScmRights for VmReceiveMigrationData {
+    fn ingest_fds(&mut self, fds: Vec<File>) -> Result<(), FdUpdateError> {
+        let restored_net_configs = mem::take(&mut self.net_fds);
+        // TODO(fd): Remove after `net_fds` is deprecated.
+        self.external_fds
+            .import_restored_net_config(restored_net_configs);
+
+        self.external_fds.ingest_fds(fds)
+    }
+}
+
+impl IngestScmRights for RestoreConfig {
+    fn ingest_fds(&mut self, fds: Vec<File>) -> Result<(), FdUpdateError> {
+        // TODO(fd): Remove after `net_fds` is deprecated.
+        if let Some(restored_net_configs) = self.net_fds.take() {
+            self.external_fds
+                .import_restored_net_config(restored_net_configs);
+        }
+        self.external_fds.ingest_fds(fds)
     }
 }
 

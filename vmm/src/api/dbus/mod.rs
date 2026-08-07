@@ -28,6 +28,7 @@ use crate::api::{
     VmResize, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmmPing,
     VmmShutdown,
 };
+use crate::external_fds::{ExternalFds, UpdateFds};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::{Error as VmmError, NetConfig, Result as VmmResult, VmConfig};
 
@@ -225,6 +226,10 @@ impl DBusApi {
                 net.fds = None;
             }
         }
+
+        vm_config
+            .consume_fds(ExternalFds::default())
+            .map_err(api_error)?;
 
         blocking::unblock(move || VmCreate.send(api_notifier, api_sender, vm_config))
             .await

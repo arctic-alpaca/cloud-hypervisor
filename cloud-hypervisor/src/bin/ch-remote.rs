@@ -1005,15 +1005,7 @@ fn snapshot_config(url: &str) -> String {
 
 fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
     let mut restore_config = RestoreConfig::parse(config).map_err(Error::Restore)?;
-    // RestoreConfig is modified on purpose to take out the file descriptors.
-    // These fds are passed to the server side process via SCM_RIGHTS
-    let fds = match &mut restore_config.net_fds {
-        Some(net_fds) => net_fds
-            .iter_mut()
-            .flat_map(|net| net.fds.take().unwrap_or_default())
-            .collect(),
-        None => Vec::new(),
-    };
+    let fds = restore_config.external_fds.fds();
     let restore_config = serde_json::to_string(&restore_config).unwrap();
 
     Ok((restore_config, fds))

@@ -92,6 +92,7 @@ use crate::coredump::{
 };
 use crate::device_manager::{DeviceManager, DeviceManagerError};
 use crate::device_tree::DeviceTree;
+use crate::external_fds::FdUpdateError;
 #[cfg(feature = "guest_debug")]
 use crate::gdb::{Debuggable, DebuggableError, GdbRequestPayload, GdbResponsePayload};
 #[cfg(feature = "igvm")]
@@ -395,6 +396,9 @@ pub enum Error {
     #[cfg(feature = "fw_cfg")]
     #[error("Error using fw_cfg while disabled")]
     FwCfgDisabled,
+
+    #[error("Error updating file descriptors")]
+    FdUpdate(#[from] FdUpdateError),
 }
 pub type Result<T> = result::Result<T, Error>;
 

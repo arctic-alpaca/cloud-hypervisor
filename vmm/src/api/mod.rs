@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use log::{info, trace};
 use micro_http::Body;
-use option_parser::{OptionParser, OptionParserError, Toggle};
+use option_parser::{OptionParser, OptionParserError, Toggle, Tuple};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_migration::MigratableError;
@@ -55,6 +55,7 @@ pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
 use crate::config::{RestoreConfig, RestoredNetConfig};
 use crate::device_tree::DeviceTree;
+use crate::external_fds::{Device, ExternalFds};
 use crate::migration_transport::MAX_MIGRATION_CONNECTIONS;
 use crate::vm::{Error as VmError, VmState};
 use crate::vm_config::{
@@ -297,6 +298,8 @@ pub struct VmReceiveMigrationData {
     /// Optional memory zone reconfiguration data.
     #[serde(default)]
     pub zones: Vec<MemoryZoneConfig>,
+    #[serde(default, flatten)]
+    pub external_fds: ExternalFds,
 }
 
 #[derive(Debug, Error)]
@@ -360,6 +363,7 @@ impl VmReceiveMigrationData {
                 net_fds: vec![],
                 tcp_serial_url: None,
                 zones: vec![],
+                external_fds: Default::default(),
             };
 
             data.validate()?;
@@ -371,7 +375,8 @@ impl VmReceiveMigrationData {
         parser
             .add("receiver_url")
             .add("tls_dir")
-            .add("tcp_serial_url");
+            .add("tcp_serial_url")
+            .add("external_fds");
         parser
             .parse(migration)
             .map_err(VmReceiveMigrationConfigError::ParseError)?;
@@ -388,6 +393,11 @@ impl VmReceiveMigrationData {
         let tcp_serial_url = parser
             .convert::<String>("tcp_serial_url")
             .map_err(VmReceiveMigrationConfigError::ParseError)?;
+        let external_fds = parser
+            .convert::<Tuple<Device, Vec<u64>>>("external_fds")
+            .map_err(VmReceiveMigrationConfigError::ParseError)?
+            .map(Into::into)
+            .unwrap_or_default();
 
         let data = Self {
             receiver_url,
@@ -395,6 +405,7 @@ impl VmReceiveMigrationData {
             net_fds: vec![],
             tcp_serial_url,
             zones: vec![],
+            external_fds,
         };
 
         data.validate()?;
@@ -2146,6 +2157,7 @@ mod unit_tests {
                 net_fds: vec![],
                 tcp_serial_url: None,
                 zones: vec![],
+                external_fds: Default::default(),
             }
         );
 
@@ -2172,6 +2184,7 @@ mod unit_tests {
                 net_fds: vec![],
                 tcp_serial_url: Some("1.2.3.4:6789".to_string()),
                 zones: vec![],
+                external_fds: Default::default(),
             }
         );
 

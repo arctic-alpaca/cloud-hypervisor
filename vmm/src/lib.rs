@@ -72,6 +72,7 @@ use crate::coredump::GuestDebuggable;
 #[cfg(feature = "kvm")]
 use crate::cpu::IS_IN_SHUTDOWN;
 use crate::device_manager::DeviceManager;
+use crate::external_fds::UpdateFds;
 use crate::landlock::Landlock;
 use crate::memory_manager::MemoryManager;
 use crate::migration::{get_vm_snapshot, recv_vm_config, recv_vm_state};
@@ -1157,7 +1158,7 @@ impl Vmm {
         listener: &ReceiveListener,
         state: ReceiveMigrationState,
         req: &Request,
-        receive_data_migration: &VmReceiveMigrationData,
+        receive_data_migration: &mut VmReceiveMigrationData,
     ) -> std::result::Result<ReceiveMigrationState, MigratableError> {
         use ReceiveMigrationState::*;
 
@@ -1179,18 +1180,13 @@ impl Vmm {
                     receive_data_migration.zones.clone(),
                 )?;
 
-                if !receive_data_migration.net_fds.is_empty() {
+                if !receive_data_migration.external_fds.is_empty() {
                     let mut vm_config = self.vm_config.as_mut().unwrap().lock().unwrap();
-                    for restored_net in &receive_data_migration.net_fds {
-                        for net_config in vm_config.net.iter_mut().flatten() {
-                            // Only update net devices that are backed directly by file descriptors.
-                            if net_config.pci_common.id.as_ref() == Some(&restored_net.id)
-                                && net_config.fds.is_some()
-                            {
-                                net_config.fds.clone_from(&restored_net.fds);
-                            }
-                        }
-                    }
+
+                    vm_config
+                        .consume_fds(mem::take(&mut receive_data_migration.external_fds))
+                        .context("Failed to update file descriptors")
+                        .map_err(MigratableError::MigrateReceive)?;
                 }
 
                 let guest_memory = memory_manager.lock().unwrap().guest_memory();
@@ -2648,24 +2644,15 @@ impl RequestHandler for Vmm {
         let vm_config = Arc::new(Mutex::new(
             recv_vm_config(source_url).map_err(VmError::Restore)?,
         ));
-        restore_cfg
-            .validate(&vm_config.lock().unwrap().clone())
-            .map_err(VmError::ConfigValidation)?;
+        restore_cfg.validate().map_err(VmError::ConfigValidation)?;
 
         // Update VM's net configurations with new fds received for restore operation
-        if let (Some(restored_nets), Some(vm_net_configs)) =
-            (restore_cfg.net_fds, &mut vm_config.lock().unwrap().net)
-        {
-            for net in restored_nets.iter() {
-                for net_config in vm_net_configs.iter_mut() {
-                    // update only if the net dev is backed by FDs
-                    if net_config.pci_common.id.as_ref() == Some(&net.id)
-                        && net_config.fds.is_some()
-                    {
-                        net_config.fds.clone_from(&net.fds);
-                    }
-                }
-            }
+
+        if !restore_cfg.external_fds.is_empty() {
+            vm_config
+                .lock()
+                .unwrap()
+                .consume_fds(restore_cfg.external_fds)?;
         }
 
         self.vm_restore(
@@ -3266,7 +3253,7 @@ impl RequestHandler for Vmm {
 
     fn vm_receive_migration(
         &mut self,
-        receive_data_migration: VmReceiveMigrationData,
+        mut receive_data_migration: VmReceiveMigrationData,
     ) -> result::Result<(), MigratableError> {
         receive_data_migration
             .validate()
@@ -3309,7 +3296,7 @@ impl RequestHandler for Vmm {
                 &listener,
                 state,
                 &req,
-                &receive_data_migration,
+                &mut receive_data_migration,
             ) {
                 Ok(next_state) => (Response::ok(), next_state, None),
                 Err(err) => {
@@ -3622,6 +3609,7 @@ mod unit_tests {
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
+            external_fds: Default::default(),
         })
     }
 

@@ -34,6 +34,7 @@ use crate::api::{
     VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore,
     VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
+use crate::external_fds::{FdUpdateError, IngestScmRightsError};
 use crate::landlock::Landlock;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::{Error as VmmError, Result};
@@ -68,6 +69,14 @@ pub enum HttpError {
     /// Error from internal API
     #[error("Error from API")]
     ApiError(#[source] ApiError),
+
+    /// Error from SCM_RIGHTS file descritors
+    #[error("Error from SCM_RIGHTS file descritors")]
+    ScmRightsError(#[from] IngestScmRightsError),
+
+    /// Error updating file descriptors
+    #[error("Error updating file descriptors")]
+    FdError(#[from] FdUpdateError),
 }
 
 const HTTP_ROOT: &str = "/api/v1";
