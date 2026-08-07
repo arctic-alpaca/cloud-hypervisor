@@ -95,6 +95,7 @@ mod coredump;
 pub mod cpu;
 pub mod device_manager;
 pub mod device_tree;
+mod external_fds;
 #[cfg(feature = "guest_debug")]
 mod gdb;
 #[cfg(feature = "igvm")]
